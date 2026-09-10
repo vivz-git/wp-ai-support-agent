@@ -1,0 +1,111 @@
+{
+  "is_fictional": true,
+  "fictional_notice": "Kettle & Bloom Coffee Roasters is a fictional business created for a public portfolio project (WP_AI_Support_Agent). It is not a real company. Any resemblance to an actual business is coincidental.",
+  "name": "Kettle & Bloom Coffee Roasters",
+  "short_name": "Kettle & Bloom",
+  "founded_year": 2019,
+  "description": "A specialty coffee roaster based in Bengaluru, India, selling single-origin and blended coffee direct to consumers online and on WhatsApp, and supplying wholesale coffee to cafes, offices, and restaurants across the city.",
+  "location": {
+    "roastery_address": "14/2 Kanakapura Main Road, Indiranagar, Bengaluru, Karnataka 560038",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "country": "India",
+    "serves_wholesale_locally": true,
+    "ships_pan_india": true
+  },
+  "contact": {
+    "whatsapp_support_hours": "9:00 AM - 7:00 PM IST, Monday to Sunday",
+    "support_email": "hello@kettleandbloom.example.invalid",
+    "website": "https://kettleandbloom.example.invalid"
+  },
+  "hours": [
+    { "day": "monday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "tuesday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "wednesday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "thursday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "friday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "saturday", "open": "09:00", "close": "19:00", "closed": false },
+    { "day": "sunday", "open": "09:00", "close": "19:00", "closed": false }
+  ],
+  "shipping_policy": {
+    "summary": "We ship pan-India via our courier partners. Orders placed before 2 PM IST are dispatched the same or next business day.",
+    "domestic_zones": [
+      { "zone": "Bengaluru", "typical_delivery_days": "1-2" },
+      { "zone": "South India (Karnataka, Tamil Nadu, Andhra Pradesh, Telangana, Kerala)", "typical_delivery_days": "2-4" },
+      { "zone": "Rest of India", "typical_delivery_days": "3-6" }
+    ],
+    "shipping_fee_note": "Free shipping on prepaid orders above 999 INR; a flat shipping fee applies below that threshold.",
+    "international_shipping": false
+  },
+  "return_policy": {
+    "summary": "We accept returns or replacements for damaged, defective, or incorrect items within 7 days of delivery. Because coffee is a perishable food product, we cannot accept returns of opened bags for reasons of taste preference.",
+    "window_days": 7,
+    "conditions": [
+      "Item must be damaged, defective, or not what was ordered",
+      "Customer must share photos of the issue for verification",
+      "Equipment (grinders, brewers, scales) can be returned unused in original packaging within 7 days"
+    ],
+    "refund_or_replacement_handled_by": "human_support_team"
+  },
+  "wholesale_info": {
+    "summary": "We supply roasted coffee to cafes, offices, restaurants, and event organizers across Bengaluru, with pan-India shipping available for larger accounts.",
+    "typical_minimum_order_kg": 5,
+    "customer_types": ["cafe", "office", "restaurant", "reseller", "events"],
+    "process_note": "Wholesale pricing and contracts are handled by the wholesale team directly; the WhatsApp assistant collects initial requirements and hands off the conversation.",
+    "pricing_disclosed_by_agent": false
+  },
+  "supported_customer_types": ["consumer", "wholesale"],
+  "payment_methods_note": "Payments are handled securely through our website checkout at the time of ordering. The WhatsApp assistant never collects payment or card details.",
+  "faqs": [
+    {
+      "id": "faq-hours",
+      "question": "What are your opening hours?",
+      "answer": "Our Indiranagar roastery and WhatsApp support are open 9 AM to 7 PM IST, seven days a week."
+    },
+    {
+      "id": "faq-shipping-time",
+      "question": "How long does shipping take?",
+      "answer": "Bengaluru orders typically arrive in 1-2 days, South India in 2-4 days, and the rest of India in 3-6 days."
+    },
+    {
+      "id": "faq-shipping-cost",
+      "question": "Is shipping free?",
+      "answer": "Shipping is free on prepaid orders above 999 INR. Below that, a flat shipping fee applies at checkout."
+    },
+    {
+      "id": "faq-returns",
+      "question": "What is your return policy?",
+      "answer": "We accept returns or replacements within 7 days for damaged, defective, or incorrect items. Opened coffee bags can't be returned for taste preference since coffee is a perishable food product."
+    },
+    {
+      "id": "faq-freshness",
+      "question": "How fresh is the coffee?",
+      "answer": "We roast in small batches and dispatch most orders within 1-3 days of roasting."
+    },
+    {
+      "id": "faq-grind",
+      "question": "Can I get my coffee pre-ground?",
+      "answer": "Yes, you can choose a grind setting for your brew method at checkout on our website."
+    },
+    {
+      "id": "faq-subscription",
+      "question": "Do you offer a coffee subscription?",
+      "answer": "Yes, we offer a monthly coffee subscription. You can pause, skip, or cancel anytime from your account."
+    },
+    {
+      "id": "faq-wholesale",
+      "question": "Do you supply cafes or offices?",
+      "answer": "Yes, we supply wholesale coffee to cafes, offices, restaurants, and events across Bengaluru, with pan-India shipping for larger accounts. Our wholesale team handles pricing and contracts directly."
+    },
+    {
+      "id": "faq-payment",
+      "question": "How do I pay?",
+      "answer": "Payments are completed securely through our website checkout. We don't collect payment details over WhatsApp."
+    },
+    {
+      "id": "faq-decaf",
+      "question": "Do you have decaf options?",
+      "answer": "Yes, we carry Swiss Water process decaf options roasted in small batches."
+    }
+  ]
+}
