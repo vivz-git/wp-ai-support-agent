@@ -5,9 +5,25 @@ from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
-    """Represents a conversational message in a chat history."""
-    role: str = Field(..., description="Role of the speaker: 'user', 'assistant', or 'system'")
+    """Represents a conversational message in a chat history.
+
+    Plain messages carry only ``role`` and ``content``. The two optional
+    tool-transcript fields exist so an orchestrator can replay a native
+    tool-calling exchange in the Groq/OpenAI wire shape: an assistant message
+    with ``tool_calls`` followed by one ``role="tool"`` message per call,
+    each correlated by ``tool_call_id``. Providers omit both fields from the
+    request whenever they are unset, so ordinary messages are unaffected.
+    """
+    role: str = Field(..., description="Role of the speaker: 'user', 'assistant', 'system', or 'tool'")
     content: str = Field(..., description="Message text content")
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Assistant-issued tool calls in provider wire format (id, type, function{name, arguments})",
+    )
+    tool_call_id: Optional[str] = Field(
+        None,
+        description="For role='tool' messages: the ID of the tool call this result answers",
+    )
 
 
 class LLMProviderError(Exception):

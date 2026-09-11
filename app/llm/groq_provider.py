@@ -68,10 +68,17 @@ class GroqProvider:
         self._client = AsyncGroq(api_key=self.api_key)
         return self._client
 
-    def _format_messages(self, messages: List[ChatMessage]) -> List[Dict[str, str]]:
-        formatted: List[Dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+    def _format_messages(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+        formatted: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
         for msg in messages:
-            formatted.append({"role": msg.role, "content": msg.content})
+            entry: Dict[str, Any] = {"role": msg.role, "content": msg.content}
+            # Tool-transcript fields are forwarded only when present so plain
+            # messages keep the exact {"role", "content"} shape.
+            if msg.tool_calls:
+                entry["tool_calls"] = msg.tool_calls
+            if msg.tool_call_id:
+                entry["tool_call_id"] = msg.tool_call_id
+            formatted.append(entry)
         return formatted
 
     async def get_agent_reply(self, messages: List[ChatMessage]) -> str:
