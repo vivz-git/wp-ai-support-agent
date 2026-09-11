@@ -5,6 +5,11 @@ returns canned ``LLMResponse`` objects (or raises), a real ``ToolRegistry``
 holding either the real ``product_lookup`` tool or small scripted tools, the
 real (fictional) knowledge base, and an in-memory ``ConversationStore``.
 No Groq or WhatsApp network calls are made anywhere in this module.
+
+Slice 8 tests (bottom of the file) add a real ``LeadExtractor`` over its own
+scripted provider and verify it enriches state before the prompt is built,
+never runs inside the tool loop, never decides qualification/escalation,
+and never turns the turn into a safe fallback when it fails.
 """
 
 import asyncio
@@ -19,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from app.agent.extraction import ALLOWED_EXTRACTION_FIELDS, LeadExtractor
+from app.agent.lead import LeadDelta, LeadTrack, QualificationState, evaluate_qualification
 from app.agent.orchestrator import (
     AGENT_MAX_TOOL_ROUNDS,
     SAFE_FALLBACK_REPLY,
@@ -27,7 +34,8 @@ from app.agent.orchestrator import (
     ToolCallRecord,
     TurnDiagnostics,
 )
-from app.agent.state import MAX_CHAT_HISTORY, ConversationState
+from app.agent.prompts import CUSTOMER_MESSAGE_OPEN
+from app.agent.state import MAX_CHAT_HISTORY, ConversationState, EscalationStatus
 from app.agent.store import ConversationStore
 from app.knowledge import get_knowledge_base
 from app.llm.base import ChatMessage, LLMProviderError, LLMResponse, TokenUsage, ToolCall
@@ -869,3 +877,678 @@ def test_milestone_one_webhook_path_still_uses_legacy_provider(client, mock_llm,
     assert response.status_code == 200
     assert len(mock_llm.calls) == 1  # get_agent_reply, the Milestone 1 path
     assert len(mock_wa.sent_messages) == 1
+
+
+# ===========================================================================
+# Slice 8: lead extraction integrated into the orchestrator
+# ===========================================================================
+#
+# Every test below wires a real ``LeadExtractor`` over its own ``ScriptedLLM``
+# (so the extraction call never competes with the agent script), or a small
+# duck-typed extractor that raises. No Groq or network calls anywhere.
+
+
+class LoggingLLM(ScriptedLLM):
+    """``ScriptedLLM`` that also appends a label to a shared log on every call, to prove ordering."""
+
+    def __init__(self, script, log: List[str], label: str):
+        super().__init__(script)
+        self._log = log
+        self._label = label
+
+    async def complete(self, messages: List[ChatMessage], **kwargs) -> LLMResponse:
+        self._log.append(self._label)
+        return await super().complete(messages, **kwargs)
+
+
+class RaisingExtractor:
+    """Extractor whose implementation crashes; must never fail the customer turn."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls = 0
+
+    async def extract(self, message: str, state=None, profile=None):
+        self.calls += 1
+        raise self._exc
+
+
+def extraction_payload(**overrides) -> LLMResponse:
+    """A complete extraction JSON object (all fields null) with ``overrides`` applied."""
+    payload = {name: None for name in ALLOWED_EXTRACTION_FIELDS}
+    payload.update(overrides)
+    return text(json.dumps(payload))
+
+
+WHOLESALE_FIELDS_RAHUL = dict(
+    track="wholesale",
+    contact_name="Rahul",
+    business_name="Bean House",
+    business_type="cafe",
+    monthly_volume_kg=25,
+    city="Bengaluru",
+    timeline="within_1_month",
+)
+
+CONSUMER_FIELDS_PRIYA = dict(
+    track="consumer",
+    contact_name="Priya",
+    brew_method="pourover",
+    taste_preference="fruity",
+    budget_band="500_1000",
+    subscription_interest=True,
+)
+
+
+def make_with_extraction(
+    agent_llm,
+    extractor_llm,
+    knowledge,
+    store,
+    tools: Optional[ToolRegistry] = None,
+    **kwargs,
+) -> AgentOrchestrator:
+    return make(agent_llm, knowledge, store, tools=tools, extractor=LeadExtractor(extractor_llm), **kwargs)
+
+
+def _state_with_lead(**fields) -> ConversationState:
+    """A fresh sender state with ``fields`` already merged (provenance turn 0)."""
+    state = ConversationState.new(SENDER)
+    state.apply_lead_delta(LeadDelta(**fields))
+    return state
+
+
+def _system_prompt(llm_call: Dict[str, Any]) -> str:
+    return llm_call["messages"][0].content
+
+
+def _delimited_user_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    return [m for m in messages if m.role == "user" and m.content.startswith(CUSTOMER_MESSAGE_OPEN)]
+
+
+# ---------------------------------------------------------------------------
+# 1-3. Extraction runs before prompt generation and is visible to the model
+# ---------------------------------------------------------------------------
+
+
+def test_successful_extraction_updates_state_before_prompt_generation(knowledge, store):
+    log: List[str] = []
+    agent_llm = LoggingLLM([text("Nice to meet you, Rahul!")], log, "agent")
+    extractor_llm = LoggingLLM([extraction_payload(contact_name="Rahul", city="Bengaluru")], log, "extract")
+    result = run(make_with_extraction(agent_llm, extractor_llm, knowledge, store), "Hi, I'm Rahul from Bengaluru")
+
+    assert log == ["extract", "agent"]
+    assert result.reply_text == "Nice to meet you, Rahul!"
+    # The first (and only) agent prompt already reflects the merged lead state.
+    assert "name=Rahul" in _system_prompt(agent_llm.calls[0])
+    assert "city=Bengaluru" in _system_prompt(agent_llm.calls[0])
+
+
+def test_extracted_name_appears_in_returned_state_snapshot(knowledge, store):
+    result = run(
+        make_with_extraction(ScriptedLLM([text("ok")]), ScriptedLLM([extraction_payload(contact_name="Rahul")]), knowledge, store),
+        "I'm Rahul",
+    )
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert result.state_snapshot.lead.field_provenance == {"contact_name": 1}
+    assert result.state_snapshot.lead.whatsapp_number == SENDER  # webhook metadata untouched
+
+
+def test_extracted_lead_track_appears_before_first_llm_call(knowledge, store):
+    agent_llm = ScriptedLLM([text("ok")])
+    run(
+        make_with_extraction(agent_llm, ScriptedLLM([extraction_payload(track="wholesale")]), knowledge, store),
+        "I run a cafe and want bulk beans",
+    )
+    assert "track=wholesale" in _system_prompt(agent_llm.calls[0])
+    assert "qualification: collecting" in _system_prompt(agent_llm.calls[0])
+
+
+# ---------------------------------------------------------------------------
+# 4-6. Deterministic qualification; consumer and wholesale fields
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_updates_qualification_deterministically(knowledge, store):
+    orchestrator = make_with_extraction(
+        ScriptedLLM([text("one"), text("two"), text("three")]),
+        ScriptedLLM(
+            [
+                extraction_payload(),  # nothing said -> browsing
+                extraction_payload(track="wholesale", contact_name="Rahul"),  # partial -> collecting
+                extraction_payload(**{k: v for k, v in WHOLESALE_FIELDS_RAHUL.items() if k != "contact_name"}),
+            ]
+        ),
+        knowledge,
+        store,
+    )
+    first = run(orchestrator, "hello")
+    assert first.state_snapshot.qualification == QualificationState.BROWSING
+
+    second = run(orchestrator, "I'm Rahul, I run a cafe")
+    assert second.state_snapshot.qualification == QualificationState.COLLECTING
+
+    third = run(orchestrator, "Bean House in Bengaluru, about 25kg a month, starting next month")
+    lead = third.state_snapshot.lead
+    assert lead.track == LeadTrack.WHOLESALE
+    assert lead.contact_name == "Rahul"
+    assert lead.business_name == "Bean House"
+    assert lead.business_type.value == "cafe"
+    assert lead.monthly_volume_kg == 25
+    assert lead.city == "Bengaluru"
+    assert lead.timeline.value == "within_1_month"
+    assert lead.missing_required_fields() == []
+    # Computed by Python from the merged profile, identical to calling the rule directly.
+    assert third.state_snapshot.qualification == QualificationState.QUALIFIED
+    assert third.state_snapshot.qualification == evaluate_qualification(lead, QualificationState.COLLECTING, 3)
+    assert lead.field_provenance["contact_name"] == 2
+    assert lead.field_provenance["business_name"] == 3
+
+
+def test_consumer_extraction_updates_consumer_fields(knowledge, store):
+    result = run(
+        make_with_extraction(ScriptedLLM([text("ok")]), ScriptedLLM([extraction_payload(**CONSUMER_FIELDS_PRIYA)]), knowledge, store),
+        "I'm Priya, pourover, fruity, 500-1000 per order, monthly subscription please",
+    )
+    lead = result.state_snapshot.lead
+    assert lead.track == LeadTrack.CONSUMER
+    assert lead.contact_name == "Priya"
+    assert lead.brew_method.value == "pourover"
+    assert lead.taste_preference == "fruity"
+    assert lead.budget_band.value == "500_1000"
+    assert lead.subscription_interest is True
+    assert lead.business_name is None
+    assert result.state_snapshot.qualification == QualificationState.QUALIFIED
+    assert result.diagnostics.extracted_field_names == list(CONSUMER_FIELDS_PRIYA.keys())
+
+
+def test_wholesale_extraction_updates_wholesale_fields(knowledge, store):
+    result = run(
+        make_with_extraction(
+            ScriptedLLM([text("ok")]),
+            ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL, current_supplier="Local roaster")]),
+            knowledge,
+            store,
+        ),
+        "Rahul from Bean House cafe, Bengaluru, 25kg/month, this month, currently with a local roaster",
+    )
+    lead = result.state_snapshot.lead
+    assert lead.track == LeadTrack.WHOLESALE
+    assert lead.business_name == "Bean House"
+    assert lead.business_type.value == "cafe"
+    assert lead.monthly_volume_kg == 25
+    assert lead.timeline.value == "within_1_month"
+    assert lead.current_supplier == "Local roaster"
+    assert lead.brew_method is None
+    assert result.state_snapshot.qualification == QualificationState.QUALIFIED
+
+
+# ---------------------------------------------------------------------------
+# 7. Null extraction keeps existing values; corrections replace them
+# ---------------------------------------------------------------------------
+
+
+def test_null_extraction_does_not_erase_existing_lead_values(knowledge, store):
+    orchestrator = make_with_extraction(
+        ScriptedLLM([text("one"), text("two")]),
+        ScriptedLLM([extraction_payload(contact_name="Rahul", city="Bengaluru"), extraction_payload()]),
+        knowledge,
+        store,
+    )
+    run(orchestrator, "I'm Rahul from Bengaluru")
+    result = run(orchestrator, "what are your hours?")
+
+    lead = result.state_snapshot.lead
+    assert lead.contact_name == "Rahul"
+    assert lead.city == "Bengaluru"
+    assert lead.field_provenance == {"contact_name": 1, "city": 1}
+    assert result.diagnostics.extraction_success is True
+    assert result.diagnostics.extracted_field_names == []
+    assert store.get(SENDER).lead.city == "Bengaluru"
+
+
+def test_corrected_extraction_value_replaces_previous_with_new_provenance(knowledge, store):
+    orchestrator = make_with_extraction(
+        ScriptedLLM([text("one"), text("two")]),
+        ScriptedLLM([extraction_payload(city="Bengaluru"), extraction_payload(city="Mysuru")]),
+        knowledge,
+        store,
+    )
+    run(orchestrator, "I'm in Bengaluru")
+    result = run(orchestrator, "sorry, I meant Mysuru")
+
+    assert result.state_snapshot.lead.city == "Mysuru"
+    assert result.state_snapshot.lead.field_provenance == {"city": 2}
+
+
+# ---------------------------------------------------------------------------
+# 8-10, 26. Extraction failure is non-fatal and never triggers the safe fallback
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_failure_is_non_fatal(knowledge, store):
+    store.save(_state_with_lead(contact_name="Rahul"))
+    # Non-JSON twice: initial attempt + one repair -> fallback result.
+    extractor_llm = ScriptedLLM([text("I cannot help with that"), text("still not json")])
+    result = run(make_with_extraction(ScriptedLLM([text("Normal reply")]), extractor_llm, knowledge, store), "hello")
+
+    assert result.reply_text == "Normal reply"
+    assert result.diagnostics.fallback_used is False
+    assert result.diagnostics.extraction_attempted is True
+    assert result.diagnostics.extraction_success is False
+    assert result.diagnostics.extraction_source == "fallback"
+    assert result.diagnostics.extraction_errors_count >= 1
+    assert result.diagnostics.extracted_field_names == []
+    assert len(extractor_llm.calls) == 2  # exactly one repair attempt, no more
+    # Lead untouched, turn still persisted normally.
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert result.state_snapshot.lead.field_provenance == {"contact_name": 0}
+    assert [m.role for m in store.get(SENDER).history] == ["user", "assistant"]
+
+
+def test_extraction_provider_exception_is_non_fatal(knowledge, store):
+    store.save(_state_with_lead(contact_name="Rahul"))
+    extractor_llm = ScriptedLLM([LLMProviderError("Bearer mock_groq_api_key_67890 rejected")])
+    result = run(make_with_extraction(ScriptedLLM([text("Normal reply")]), extractor_llm, knowledge, store), "hello")
+
+    assert result.reply_text == "Normal reply"
+    assert result.diagnostics.fallback_used is False
+    assert result.diagnostics.extraction_success is False
+    assert result.diagnostics.extraction_source == "fallback"
+    assert len(extractor_llm.calls) == 1  # provider errors are not repaired
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert "mock_groq_api_key_67890" not in json.dumps(result.diagnostics.model_dump())
+
+
+def test_malformed_extraction_output_is_non_fatal(knowledge, store):
+    # Valid JSON but the wrong shape, then a repair that is also invalid.
+    extractor_llm = ScriptedLLM([text('["not", "an", "object"]'), text('{"monthly_volume_kg": "lots"}')])
+    result = run(make_with_extraction(ScriptedLLM([text("Normal reply")]), extractor_llm, knowledge, store), "hello")
+
+    assert result.reply_text == "Normal reply"
+    assert result.diagnostics.fallback_used is False
+    assert result.diagnostics.extraction_success is False
+    assert result.state_snapshot.lead.has_any_lead_data() is False
+
+
+def test_repaired_extraction_output_is_applied(knowledge, store):
+    extractor_llm = ScriptedLLM([text("not json"), extraction_payload(contact_name="Rahul")])
+    result = run(make_with_extraction(ScriptedLLM([text("ok")]), extractor_llm, knowledge, store), "I'm Rahul")
+
+    assert result.diagnostics.extraction_success is True
+    assert result.diagnostics.extraction_source == "model_repaired"
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+
+
+def test_unexpected_extractor_exception_is_contained(knowledge, store):
+    store.save(_state_with_lead(contact_name="Rahul"))
+    extractor = RaisingExtractor(RuntimeError("secret detail: Bearer mock_groq_api_key_67890"))
+    result = run(make(ScriptedLLM([text("Normal reply")]), knowledge, store, extractor=extractor), "hello")
+
+    assert extractor.calls == 1
+    assert result.reply_text == "Normal reply"
+    assert result.diagnostics.fallback_used is False
+    assert result.diagnostics.extraction_attempted is True
+    assert result.diagnostics.extraction_success is False
+    assert result.diagnostics.extraction_error_type == "RuntimeError"
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert "secret detail" not in json.dumps(result.diagnostics.model_dump())
+    assert store.get(SENDER).turn_count == 1
+
+
+def test_extraction_failure_does_not_trigger_safe_fallback_by_itself(knowledge, store):
+    extractor_llm = ScriptedLLM([LLMProviderError("extractor down")])
+    result = run(make_with_extraction(ScriptedLLM([text("Still fine")]), extractor_llm, knowledge, store), "hello")
+
+    assert result.reply_text == "Still fine"
+    assert result.reply_text != SAFE_FALLBACK_REPLY
+    assert result.diagnostics.fallback_used is False
+    assert result.diagnostics.fallback_reason is None
+    assert result.diagnostics.error_type is None
+    assert result.diagnostics.loop_exit == "text_reply"
+
+
+# ---------------------------------------------------------------------------
+# 11, 12, 14. Exactly one extraction per turn; tool loop unaffected
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_occurs_exactly_once_per_turn(knowledge, store):
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul"), extraction_payload()])
+    orchestrator = make_with_extraction(ScriptedLLM([text("one"), text("two")]), extractor_llm, knowledge, store)
+
+    run(orchestrator, "I'm Rahul")
+    assert len(extractor_llm.calls) == 1
+    run(orchestrator, "hello again")
+    assert len(extractor_llm.calls) == 2
+
+
+def test_extraction_does_not_occur_once_per_tool_round(knowledge, store):
+    tool = scripted_tool("lookup", [OK_RESULT, OK_RESULT])
+    agent_llm = ScriptedLLM(
+        [
+            tool_calls(call("call_1", "lookup", '{"q": "a"}')),
+            tool_calls(call("call_2", "lookup", '{"q": "b"}')),
+            text("final"),
+        ]
+    )
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    result = run(
+        make_with_extraction(agent_llm, extractor_llm, knowledge, store, tools=registry_with(tool)),
+        "I'm Rahul, two things",
+    )
+
+    assert result.reply_text == "final"
+    assert result.diagnostics.tool_rounds == AGENT_MAX_TOOL_ROUNDS
+    assert result.diagnostics.llm_calls == 3
+    assert len(extractor_llm.calls) == 1
+    assert extractor_llm.exhausted
+    # Tool calls never reach the extractor's provider.
+    assert all("tools" not in c["kwargs"] for c in extractor_llm.calls)
+
+
+def test_tool_loop_still_works_after_extraction(knowledge, store):
+    agent_llm = ScriptedLLM([tool_calls(call("call_1")), text("Yes! Ethiopia is in stock.")])
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    result = run(make_with_extraction(agent_llm, extractor_llm, knowledge, store), "I'm Rahul, do you have Ethiopia?")
+
+    assert result.reply_text == "Yes! Ethiopia is in stock."
+    assert [r.disposition for r in result.tool_calls] == ["executed"]
+    assert result.tool_calls[0].status == "ok"
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert result.state_snapshot.current_turn_tool_results[0].tool_name == "product_lookup"
+    # Every agent call in the loop sees the updated lead state.
+    assert all("name=Rahul" in _system_prompt(c) for c in agent_llm.calls)
+    second_call = agent_llm.calls[1]["messages"]
+    assert second_call[-2].role == "assistant" and second_call[-1].role == "tool"
+
+
+# ---------------------------------------------------------------------------
+# 13, 21. Prompt receives updated state; current message still sent once
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_receives_updated_state(knowledge, store):
+    agent_llm = ScriptedLLM([text("ok")])
+    run(
+        make_with_extraction(agent_llm, ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)]), knowledge, store),
+        "Rahul from Bean House",
+    )
+    system_prompt = _system_prompt(agent_llm.calls[0])
+    assert "qualification: qualified" in system_prompt
+    assert "name=Rahul" in system_prompt
+    assert "city=Bengaluru" in system_prompt
+    assert "track=wholesale" in system_prompt
+
+
+def test_duplicate_current_message_prevention_still_works_with_extraction(knowledge, store):
+    agent_llm = ScriptedLLM([tool_calls(call("call_1")), text("done")])
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store)
+    run(orchestrator, "I'm Rahul, do you have Ethiopia?")
+
+    for llm_call in agent_llm.calls:
+        messages = llm_call["messages"]
+        delimited = _delimited_user_messages(messages)
+        assert len(delimited) == 1
+        assert "I'm Rahul, do you have Ethiopia?" in delimited[0].content
+        assert sum("I'm Rahul, do you have Ethiopia?" in m.content for m in messages) == 1
+    # The extractor sees the message once too, delimited.
+    extractor_messages = extractor_llm.calls[0]["messages"]
+    assert len(_delimited_user_messages(extractor_messages)) == 1
+    # History is written once, after the loop.
+    assert [m.role for m in store.get(SENDER).history] == ["user", "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# 15, 22. Persistence and sender isolation
+# ---------------------------------------------------------------------------
+
+
+def test_extracted_state_persists_to_conversation_store(knowledge, store):
+    run(
+        make_with_extraction(ScriptedLLM([text("ok")]), ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)]), knowledge, store),
+        "Rahul from Bean House",
+    )
+    stored = store.get(SENDER)
+    assert stored.lead.contact_name == "Rahul"
+    assert stored.lead.business_name == "Bean House"
+    assert stored.qualification == QualificationState.QUALIFIED
+    assert stored.lead.field_provenance["business_name"] == 1
+    # Round-trips through the store's JSON snapshot.
+    restored = ConversationStore.from_snapshot(store.snapshot()).get(SENDER)
+    assert restored.lead.business_name == "Bean House"
+
+
+def test_sender_isolation_with_extraction(knowledge, store):
+    orchestrator = make_with_extraction(
+        ScriptedLLM([text("one"), text("two")]),
+        ScriptedLLM([extraction_payload(contact_name="Rahul"), extraction_payload(contact_name="Priya")]),
+        knowledge,
+        store,
+    )
+    run(orchestrator, "I'm Rahul", sender=SENDER)
+    run(orchestrator, "I'm Priya", sender=OTHER_SENDER)
+
+    assert store.get(SENDER).lead.contact_name == "Rahul"
+    assert store.get(OTHER_SENDER).lead.contact_name == "Priya"
+    assert store.get(SENDER).lead.whatsapp_number == SENDER
+    assert store.get(OTHER_SENDER).lead.whatsapp_number == OTHER_SENDER
+
+
+# ---------------------------------------------------------------------------
+# 16, 17. Diagnostics and extraction prompt are safe
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_diagnostics_are_safe(knowledge, store):
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL, email="rahul@example.com")])
+    result = run(
+        make_with_extraction(ScriptedLLM([text("ok")]), extractor_llm, knowledge, store),
+        "Rahul from Bean House, rahul@example.com",
+        message_id="wamid.X",
+    )
+    diagnostics = result.diagnostics
+    assert diagnostics.extraction_attempted is True
+    assert diagnostics.extraction_success is True
+    assert diagnostics.extraction_source == "model"
+    assert set(diagnostics.extracted_field_names) == set(WHOLESALE_FIELDS_RAHUL) | {"email"}
+    assert diagnostics.extraction_errors_count == 0
+    assert diagnostics.extraction_error_type is None
+
+    safe_blob = json.dumps(diagnostics.model_dump())
+    # Field names only: no extracted values, no phone number, no secrets.
+    for value in ("Rahul", "Bean House", "Bengaluru", "rahul@example.com"):
+        assert value not in safe_blob
+    assert SENDER not in safe_blob
+    assert "raw_response" not in safe_blob
+    for var in _SECRET_ENV_VARS:
+        assert os.environ[var] not in safe_blob
+    assert "Bearer" not in safe_blob
+    assert "Authorization" not in safe_blob
+    json.dumps(result.model_dump(mode="json"))
+
+
+def test_no_credentials_enter_extraction_prompt(knowledge, store):
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    run(make_with_extraction(ScriptedLLM([text("ok")]), extractor_llm, knowledge, store), "I'm Rahul")
+
+    assert len(extractor_llm.calls) == 1
+    prompt_blob = json.dumps([m.model_dump() for m in extractor_llm.calls[0]["messages"]])
+    for var in _SECRET_ENV_VARS:
+        assert os.environ[var] not in prompt_blob
+    assert "Bearer" not in prompt_blob
+    assert "Authorization" not in prompt_blob
+    assert SENDER not in prompt_blob
+    assert extractor_llm.calls[0]["kwargs"] == {}  # plain completion: no tools offered
+
+
+# ---------------------------------------------------------------------------
+# 18, 19. Model output cannot inject qualification or escalation
+# ---------------------------------------------------------------------------
+
+
+def test_qualification_cannot_be_injected_by_model_output(knowledge, store):
+    injected = {
+        "contact_name": "Rahul",
+        "qualification": "qualified",
+        "qualified": True,
+        "handoff_ready": True,
+        "declined": True,
+    }
+    extractor_llm = ScriptedLLM([text(json.dumps(injected))])
+    result = run(make_with_extraction(ScriptedLLM([text("ok")]), extractor_llm, knowledge, store), "I'm Rahul")
+
+    state = result.state_snapshot
+    assert state.lead.contact_name == "Rahul"
+    # Only a name is known: Python computes ``collecting``, whatever the model claimed.
+    assert state.qualification == QualificationState.COLLECTING
+    assert state.qualification == evaluate_qualification(state.lead, QualificationState.UNKNOWN, 1)
+    assert state.flags.declines == 0
+    assert result.diagnostics.extraction_success is True
+    assert result.diagnostics.extraction_errors_count == 4  # the dropped fields
+    assert result.diagnostics.extracted_field_names == ["contact_name"]
+    assert not any(name in result.diagnostics.extracted_field_names for name in injected if name != "contact_name")
+
+
+def test_escalation_cannot_be_injected_by_model_output(knowledge, store):
+    injected = {
+        "contact_name": "Rahul",
+        "escalated": True,
+        "escalation": {"status": "pending", "reason": "angry"},
+        "escalation_status": "handed_off",
+    }
+    extractor_llm = ScriptedLLM([text(json.dumps(injected))])
+    agent_llm = ScriptedLLM([text("ok")])
+    result = run(make_with_extraction(agent_llm, extractor_llm, knowledge, store), "I'm Rahul")
+
+    state = result.state_snapshot
+    assert state.escalation.status == EscalationStatus.NONE
+    assert state.escalation.reason is None
+    assert state.qualification == QualificationState.COLLECTING
+    assert state.qualification != QualificationState.ESCALATED
+    assert store.get(SENDER).escalation.status == EscalationStatus.NONE
+    assert "escalation_status: none" in _system_prompt(agent_llm.calls[0])
+    assert "qualification: collecting" in _system_prompt(agent_llm.calls[0])
+
+
+# ---------------------------------------------------------------------------
+# 20, 23, 24, 25. Existing orchestrator behaviour remains intact
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_without_extractor_behaves_as_before(knowledge, store):
+    llm = ScriptedLLM([text("hi")])
+    result = run(make(llm, knowledge, store), "hello")
+
+    assert len(llm.calls) == 1
+    assert result.diagnostics.extraction_attempted is False
+    assert result.diagnostics.extraction_success is False
+    assert result.diagnostics.extraction_source is None
+    assert result.diagnostics.extracted_field_names == []
+    assert result.diagnostics.extraction_errors_count == 0
+    assert result.diagnostics.extraction_error_type is None
+    assert result.state_snapshot.lead.has_any_lead_data() is False
+    assert result.state_snapshot.qualification == QualificationState.UNKNOWN
+
+
+def test_maximum_tool_round_behaviour_remains_intact_with_extraction(knowledge, store):
+    tool = scripted_tool("lookup", [OK_RESULT, OK_RESULT, OK_RESULT])
+    agent_llm = ScriptedLLM(
+        [
+            tool_calls(call("c1", "lookup", "{}")),
+            tool_calls(call("c2", "lookup", "{}")),
+            text("final after limit"),
+        ]
+    )
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    result = run(
+        make_with_extraction(agent_llm, extractor_llm, knowledge, store, tools=registry_with(tool)),
+        "I'm Rahul",
+    )
+
+    assert result.reply_text == "final after limit"
+    assert result.diagnostics.tool_rounds == AGENT_MAX_TOOL_ROUNDS
+    assert result.diagnostics.tool_round_limit_reached is True
+    assert result.diagnostics.loop_exit == "tool_round_limit"
+    assert len(result.tool_calls) == 2
+    assert len(extractor_llm.calls) == 1
+
+
+def test_final_text_only_call_behaviour_remains_intact_with_extraction(knowledge, store):
+    tool = scripted_tool("lookup", [OK_RESULT, OK_RESULT])
+    agent_llm = ScriptedLLM(
+        [
+            tool_calls(call("c1", "lookup", "{}")),
+            tool_calls(call("c2", "lookup", "{}")),
+            text("final"),
+        ]
+    )
+    result = run(
+        make_with_extraction(agent_llm, ScriptedLLM([extraction_payload()]), knowledge, store, tools=registry_with(tool)),
+        "hi",
+    )
+
+    assert result.diagnostics.final_call_tools_omitted is True
+    final_kwargs = agent_llm.calls[-1]["kwargs"]
+    assert "tools" not in final_kwargs
+    assert "tool_choice" not in final_kwargs
+    assert all(c["kwargs"].get("tool_choice") != "none" for c in agent_llm.calls)
+    assert all("tools" in c["kwargs"] for c in agent_llm.calls[:-1])
+
+
+def test_safe_fallback_on_llm_failure_still_works_and_keeps_extracted_lead(knowledge, store):
+    agent_llm = ScriptedLLM([LLMProviderError("Groq down")])
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    result = run(make_with_extraction(agent_llm, extractor_llm, knowledge, store), "I'm Rahul")
+
+    assert result.reply_text == SAFE_FALLBACK_REPLY
+    assert result.diagnostics.fallback_used is True
+    assert result.diagnostics.fallback_reason == "llm_error"
+    assert result.diagnostics.error_type == "LLMProviderError"
+    # Extraction succeeded independently and its state is still persisted.
+    assert result.diagnostics.extraction_success is True
+    assert store.get(SENDER).lead.contact_name == "Rahul"
+    assert [m.role for m in store.get(SENDER).history] == ["user", "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# 27. No network activity with extraction enabled
+# ---------------------------------------------------------------------------
+
+
+def test_no_network_activity_with_extraction_enabled(knowledge, store, monkeypatch):
+    loopback = {"127.0.0.1", "::1", "localhost"}
+    original_connect = socket.socket.connect
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _guarded_connect(sock, address, *args, **kwargs):
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in loopback:
+            raise AssertionError(f"network access attempted during orchestrator turn: {host!r}")
+        return original_connect(sock, address, *args, **kwargs)
+
+    def _guarded_getaddrinfo(host, *args, **kwargs):
+        if host not in loopback:
+            raise AssertionError(f"DNS lookup attempted during orchestrator turn: {host!r}")
+        return original_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
+    monkeypatch.setattr(socket, "getaddrinfo", _guarded_getaddrinfo)
+
+    agent_llm = ScriptedLLM([tool_calls(call("call_1")), text("done")])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)])
+    result = run(make_with_extraction(agent_llm, extractor_llm, knowledge, store), "Rahul from Bean House, Ethiopia?")
+
+    assert result.reply_text == "done"
+    assert result.tool_calls[0].status == "ok"
+    assert result.state_snapshot.qualification == QualificationState.QUALIFIED
+    assert agent_llm.exhausted and extractor_llm.exhausted
+
+
+def test_extraction_integration_is_not_wired_into_app_main():
+    import app.main as main_module
+
+    main_source = inspect.getsource(main_module)
+    assert "LeadExtractor" not in main_source
+    assert "extraction" not in main_source

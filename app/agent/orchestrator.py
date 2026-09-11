@@ -4,6 +4,7 @@
 pieces built in earlier Milestone 2 slices:
 
     ConversationStore  -> load / save ``ConversationState``
+    LeadExtractor      -> validated ``LeadDelta`` from the customer message
     PromptBuilder      -> business-aware messages for the LLM
     LLMProvider        -> ``complete(messages, tools=...)`` (native tool calling)
     ToolRegistry       -> tool specs + deterministic tool execution
@@ -24,8 +25,19 @@ Design constraints (Milestone 2, Slice 6):
 - ``handle_turn`` never raises for provider or tool failures: it logs the
   exception type only, returns a deterministic safe fallback reply, and
   still persists valid state.
-- No guardrails, escalation, lead extraction or qualification policy here;
-  those are later slices.
+
+Lead extraction (Milestone 2, Slice 8):
+- An optional ``LeadExtractor`` runs exactly once per customer turn, after
+  ``begin_turn`` and before the first prompt is built, so the model sees
+  the current lead state. It never runs inside the tool loop.
+- The extractor stays pure: its ``LeadDelta`` enters state only through
+  ``ConversationState.apply_lead_delta``, which owns merge/provenance and
+  recomputes qualification deterministically. The model never sets
+  qualification or escalation; ``LeadDelta`` has no such fields.
+- Extraction is enrichment, not the response path: a failed, malformed,
+  or crashing extraction leaves the lead profile untouched and the turn
+  continues normally. It never triggers the safe fallback by itself.
+- No guardrails or escalation policy here; those are later slices.
 """
 
 import json
@@ -35,6 +47,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent.extraction import ExtractionResult, LeadExtractor
 from app.agent.prompts import PromptBuilder
 from app.agent.state import ConversationState, MAX_MESSAGE_LENGTH, ToolInvocation
 from app.agent.store import ConversationStore
@@ -84,6 +97,9 @@ LoopExit = Literal[
 
 FallbackReason = Literal["empty_reply", "llm_error"]
 
+ExtractionSource = Literal["model", "model_repaired", "fallback"]
+_EXTRACTION_SOURCES = ("model", "model_repaired", "fallback")
+
 
 # ---------------------------------------------------------------------------
 # Result models
@@ -131,6 +147,13 @@ class TurnDiagnostics(BaseModel):
     error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
     usage_prompt_tokens: int = Field(0, ge=0)
     usage_completion_tokens: int = Field(0, ge=0)
+    # Lead extraction (field NAMES only; never extracted values or raw model output).
+    extraction_attempted: bool = False
+    extraction_success: bool = False
+    extraction_source: Optional[ExtractionSource] = None
+    extracted_field_names: List[str] = Field(default_factory=list)
+    extraction_errors_count: int = Field(0, ge=0)
+    extraction_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
 
 
 class AgentTurnResult(BaseModel):
@@ -169,6 +192,13 @@ class _TurnContext:
     final_call_tools_omitted: bool = False
     usage_prompt_tokens: int = 0
     usage_completion_tokens: int = 0
+    # Lead extraction outcome (set at most once per turn, before the LLM loop).
+    extraction_attempted: bool = False
+    extraction_success: bool = False
+    extraction_source: Optional[ExtractionSource] = None
+    extracted_field_names: List[str] = field(default_factory=list)
+    extraction_errors_count: int = 0
+    extraction_error_type: Optional[str] = None
 
     @property
     def invalid_input_budget_exhausted(self) -> bool:
@@ -242,8 +272,9 @@ class AgentOrchestrator:
     """Coordinates one conversation turn: state -> prompt -> LLM -> tools -> reply.
 
     The orchestrator is a coordinator, not a store: all history lives in
-    ``ConversationState`` (persisted through ``ConversationStore``), and all
-    prompt text comes from ``PromptBuilder``.
+    ``ConversationState`` (persisted through ``ConversationStore``), all
+    prompt text comes from ``PromptBuilder``, and lead data comes only from
+    the optional ``LeadExtractor`` (merged through ``ConversationState``).
     """
 
     def __init__(
@@ -253,6 +284,7 @@ class AgentOrchestrator:
         tools: ToolRegistry,
         store: ConversationStore,
         max_tool_rounds: int = AGENT_MAX_TOOL_ROUNDS,
+        extractor: Optional[LeadExtractor] = None,
     ):
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must not be negative")
@@ -261,6 +293,8 @@ class AgentOrchestrator:
         self._tools = tools
         self._store = store
         self._max_tool_rounds = max_tool_rounds
+        # ``None`` disables lead extraction; the turn then runs exactly as in Slice 6.
+        self._extractor = extractor
 
     # -- Public API ---------------------------------------------------------
 
@@ -295,7 +329,12 @@ class AgentOrchestrator:
         ctx = _TurnContext(state=state, text=customer_text)
         masked_sender = mask_phone_number(sender_id)
 
-        # 3-9. Prompt -> LLM -> tools -> reply, with a deterministic fallback.
+        # 3-5. Extract lead data once, merge it, recompute qualification.
+        # Runs before any prompt is built so the model sees the updated lead
+        # state; failure here is non-fatal and never touches the profile.
+        await self._update_lead(ctx, masked_sender, turn)
+
+        # 6-9. Prompt -> LLM -> tools -> reply, with a deterministic fallback.
         fallback_reason: Optional[FallbackReason] = None
         error_type: Optional[str] = None
         try:
@@ -340,9 +379,16 @@ class AgentOrchestrator:
             error_type=error_type,
             usage_prompt_tokens=ctx.usage_prompt_tokens,
             usage_completion_tokens=ctx.usage_completion_tokens,
+            extraction_attempted=ctx.extraction_attempted,
+            extraction_success=ctx.extraction_success,
+            extraction_source=ctx.extraction_source,
+            extracted_field_names=list(ctx.extracted_field_names),
+            extraction_errors_count=ctx.extraction_errors_count,
+            extraction_error_type=ctx.extraction_error_type,
         )
         logger.info(
-            "Agent turn complete for %s: turn=%d llm_calls=%d tool_rounds=%d tool_calls=%d exit=%s fallback=%s",
+            "Agent turn complete for %s: turn=%d llm_calls=%d tool_rounds=%d tool_calls=%d exit=%s fallback=%s "
+            "extraction=%s qualification=%s",
             masked_sender,
             turn,
             diagnostics.llm_calls,
@@ -350,6 +396,8 @@ class AgentOrchestrator:
             diagnostics.tool_calls_requested,
             diagnostics.loop_exit,
             diagnostics.fallback_used,
+            diagnostics.extraction_source or "skipped",
+            state.qualification.value,
         )
 
         # 11. Structured result.
@@ -359,6 +407,53 @@ class AgentOrchestrator:
             tool_calls=list(ctx.records),
             diagnostics=diagnostics,
         )
+
+    # -- Lead extraction ----------------------------------------------------
+
+    async def _update_lead(self, ctx: _TurnContext, masked_sender: str, turn: int) -> None:
+        """Extract lead data from the current message and merge it into state.
+
+        Exactly one extraction per customer turn, never per tool round. The
+        extractor is pure: its delta reaches the profile only through
+        ``ConversationState.apply_lead_delta``, which owns merge/provenance
+        and recomputes qualification deterministically. Never raises — an
+        extractor that fails, returns fallback, or crashes leaves the lead
+        profile untouched and the turn continues normally.
+        """
+        if self._extractor is None:
+            return
+        ctx.extraction_attempted = True
+        try:
+            result: ExtractionResult = await self._extractor.extract(
+                ctx.text,
+                state=ctx.state,
+                profile=ctx.state.lead,
+            )
+            ctx.extraction_source = result.source if result.source in _EXTRACTION_SOURCES else None
+            ctx.extraction_errors_count = len(result.errors)
+            if not result.success:
+                logger.info("Lead extraction for %s (turn %d) fell back; lead state unchanged", masked_sender, turn)
+                return
+            # The ONLY point where extracted data enters state.
+            qualification = ctx.state.apply_lead_delta(result.delta)
+            ctx.extraction_success = True
+            ctx.extracted_field_names = list(result.delta.provided_fields().keys())
+            logger.info(
+                "Lead extraction for %s (turn %d): fields=%s qualification=%s",
+                masked_sender,
+                turn,
+                ctx.extracted_field_names,
+                qualification.value,
+            )
+        except Exception as exc:  # extraction is enrichment; it must never fail the turn
+            ctx.extraction_error_type = type(exc).__name__
+            logger.error(
+                "Lead extraction failed for %s (turn %d): %s; lead state unchanged",
+                masked_sender,
+                turn,
+                ctx.extraction_error_type,
+            )
+            logger.debug("Lead extraction failure detail", exc_info=exc)
 
     # -- Turn pipeline ------------------------------------------------------
 
