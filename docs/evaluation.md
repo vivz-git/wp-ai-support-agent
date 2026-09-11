@@ -1,6 +1,7 @@
 # Agent Core Evaluation (Milestone 2, Slice 13)
 
-Suite: `tests/test_agent_evaluation.py` (34 tests, all passing; full suite 655/655).
+Suite: `tests/test_agent_evaluation.py` (35 tests, all passing; full suite 690/690 after
+Slice 14 — 34 tests / 655 total at the end of Slice 13).
 
 Every scenario drives the real `AgentOrchestrator` end to end:
 
@@ -52,28 +53,93 @@ No production code was modified.
 | 28 | > 4096-char message with injection and `!!!` runs | bounded to 4096 in history, refused, no model call | pass |
 | 29 | Greeting → product → preference → business → human | state and provenance accumulate; escalation carries lead + 10-entry transcript | pass |
 | 30 | 8-turn realistic conversation (with correction and mild frustration) | zero grounding violations, city correction reflected in handoff, exactly one handoff, no network | pass |
-| — | Policy edge case: qualified lead + injection | see below | pinned |
+| — | Policy edge case: qualified lead + injection | `refuse`, no model call, no new handoff (Slice 14; see below) | pass |
 | — | Diagnostics sanitation across refusal/escalation/grounding turns | no customer text, raw number, secrets or model output in diagnostics | pass |
 
-## Known policy edge case (pinned, not changed)
+## Policy edge case: qualified lead + injection (resolved in Slice 14)
 
-For a lead whose profile is already `qualified` and complete, an injection
-message produces `handoff_ready` (priority 7) rather than `refuse`
-(priority 8/9). The turn therefore proceeds to the model with the injected
-text delimited as untrusted customer content; the deterministic refusal is
-not used. The injection *is* still counted in `ConversationFlags`, so a second
-attempt crosses `INJECTION_ESCALATION_HITS` and escalates (priority 6). The
-evaluation pins this observed ordering; a dedicated policy-review slice will
-decide whether injection restrictions should outrank the qualified-lead rule.
+**Before Slice 14 (observed in Slice 13, pinned then):** for a lead whose
+profile was already `qualified` and complete, an injection message produced
+`handoff_ready` (priority 7) rather than `refuse` (priority 8/9). The turn
+proceeded to the model with the injected text delimited as untrusted
+customer content; the deterministic refusal was not used. Only a second
+attempt (crossing `INJECTION_ESCALATION_HITS`) escalated.
+
+**After Slice 14:** the two injection refusals were moved above the
+qualified-lead rule — priorities 7/8 for `injection_secrets_requested` /
+`injection_internal_data_requested` / `injection_attempt`, 9 for
+`lead_qualified` / `handoff_ready`. Ranks 1–6 and 10–12 are unchanged. The
+principle: *security restrictions must not be bypassed by qualification
+state.* Observed end to end
+(`test_policy_edge_case_qualified_lead_plus_injection_is_refused_since_slice_14`,
+`test_policy_edge_case_qualified_lead_recovers_to_handoff_ready_after_a_single_refusal`):
+
+| Qualified lead sends… | Decision | Reply | Model call | Handoff |
+|---|---|---|---|---|
+| ordinary message | `handoff_ready` (9) | grounded model reply | yes | `qualified_lead` (deduplicated) |
+| human request | `escalate` (3) | `HUMAN_HANDOFF_REPLY` | no | `escalation` |
+| basic injection | `refuse` (8) `["injection_attempt", "lead_qualified"]` | `SAFE_REFUSAL_REPLY` | no | none |
+| secret / system-prompt request | `refuse` (7) | `SAFE_REFUSAL_REPLY` | no | none |
+| repeated or multi-pattern injection | `escalate` (6) `injection_repeated` | `HUMAN_HANDOFF_REPLY` | no | `escalation` |
+| ordinary message after one refusal | `handoff_ready` (9) | grounded model reply | yes | deduplicated |
+
+The `lead_qualified` code is still appended to `reason_codes` on a refused
+turn so the outcome stays explainable; qualification is neither demoted nor
+transitioned by a refusal (state stays `qualified`, `escalation.status`
+stays `none`). An incomplete lead plus injection is refused without any
+`lead_qualified`/`handoff_ready` code. The exhaustive policy-level check
+(`tests/test_escalation.py::test_slice14_security_sensitive_decision_cannot_become_handoff_ready`)
+covers every qualification state × injection variant × prior-hit count.
+
+Tests deliberately updated for the swap (the only "old" assertions touched):
+`test_escalation.py::test_escalation_priority_is_deterministic` (7/8/9 →
+9/7/8), `test_orchestrator.py::test_qualified_complete_lead_creates_qualified_lead_handoff`
+(`policy_priority` 7 → 9), and the Slice 13 pin above, rewritten to pin the
+reviewed behaviour.
+
+## Slice 14 hardening review (no production defects found)
+
+Reviewed and pinned by `test_slice14_*` in `tests/test_escalation.py` (11
+tests) and `tests/test_orchestrator.py` (23 tests):
+
+- **Determinism.** Identical `(state, signals)` → identical
+  `EscalationDecision`, across fresh policy instances and structurally-equal
+  fresh inputs; `reason_codes` is always in priority order with no
+  duplicates; the winning priority equals the rank of the first code. The
+  policy module imports no LLM, clock, randomness or network.
+- **Python control.** Neither the agent model nor the extractor model can set
+  qualification, escalation or a handoff: `LeadDelta` and `GuardrailSignals`
+  have no such fields, the orchestrator constructs exactly one
+  `EscalationDecision` itself (the fail-closed `policy_error` constant) and
+  never calls `mark_handoff_ready`.
+- **WAMID boundary.** The agent package contains no ledger, no
+  `wamid`/`has_processed`/`mark_processed`, no `app.memory` or
+  `app.whatsapp` import; `message_id` is optional and only echoed into
+  diagnostics; `app/main.py` still checks the ledger before its model call.
+  Contract for Slice 15: `docs/live_integration_contract.md`.
+- **Failure boundaries.** Guardrail, policy, grounding, LLM, tool,
+  extraction and sink failures (each raising an error whose message carries a
+  fake `Authorization: Bearer …` header) are contained, produce identical
+  replies/diagnostics/state on two identical runs, persist state, and leak
+  nothing into the reply, diagnostics, state, tool records or INFO-level
+  logs (no stack traces at INFO).
+- **Diagnostics.** Every string leaf of `TurnDiagnostics` matches
+  `[A-Za-z0-9_.*:-]+` — no free text, so no customer text, model output,
+  system prompt (checked line by line against the real built prompt), API
+  keys, headers or unmasked numbers can appear. `AgentTurnResult.tool_calls`
+  is model-authored and *can* echo customer text (a phone number copied into
+  a tool query); it is not part of diagnostics and must not be logged as such.
 
 ## Architectural observations
 
-1. **Idempotency is not the orchestrator's job (yet).** `handle_turn` records
-   `message_id` in diagnostics only. Calling it twice with the same ID
-   processes two turns. Message-level deduplication currently lives in
+1. **Idempotency is not the orchestrator's job — by contract.** `handle_turn`
+   records `message_id` in diagnostics only. Calling it twice with the same
+   ID processes two turns. Message-level deduplication lives in
    `InMemoryConversationMemory.has_processed/mark_processed` on the
-   Milestone 1 webhook path; the slice that wires the agent core into the
-   webhook must keep that ledger in front of `handle_turn`.
+   Milestone 1 webhook path; Slice 14 fixed this as the architectural
+   boundary (`docs/live_integration_contract.md`) and the slice that wires
+   the agent core into the webhook must keep that ledger in front of
+   `handle_turn`.
 2. **Anger needs complaint context to escalate.** "This is ridiculous!!! I've
    asked three times! Fix this now!" scores 0.85 but "asked three times" is
    not in the complaint lexicon, so a fresh conversation gets `clarify`. With

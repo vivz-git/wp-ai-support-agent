@@ -24,9 +24,9 @@ Decision priority (lower number wins; every rule that fires is kept in
      4  high anger + complaint     -> escalate
      5  repeated unresolved ask    -> escalate
      6  repeated/aggressive injection -> escalate
-     7  qualified, complete lead   -> handoff_ready
-     8  injection + secrets/internal data request -> refuse
-     9  basic injection attempt    -> refuse
+     7  injection + secrets/internal data request -> refuse
+     8  basic injection attempt    -> refuse
+     9  qualified, complete lead   -> handoff_ready
     10  high anger, no complaint context -> clarify
     11  single repetition          -> clarify
     12  nothing fired              -> continue
@@ -35,8 +35,26 @@ Grounding outranks even a sticky escalation because an ungrounded reply
 must not be sent regardless of who will handle the conversation next; the
 orchestrator re-evaluates once it has a safe reply. Qualified handoff sits
 below every escalation (a customer who needs a human is routed there even
-if their lead profile is complete) and above injection restrictions, per
-the slice's domain ordering.
+if their lead profile is complete).
+
+Security restrictions are never bypassed by qualification state (Milestone
+2, Slice 14). Every injection rule (6, 7, 8) outranks the qualified-lead
+rule (9), so a qualified, complete lead who sends an injection or a
+secret/internal-data request gets the same ``refuse``/``escalate`` verdict
+as any other sender; the ``lead_qualified`` code is still appended to
+``reason_codes`` so the outcome stays explainable. Before Slice 14 the
+qualified-lead rule sat at 7 and the two refusals at 8/9, so a qualified
+lead's injection turn came back ``handoff_ready`` and reached the model
+(pinned in the Slice 13 evaluation). Only those three ranks were swapped;
+ranks 1-6 and 10-12 are unchanged, so an angry-but-not-complaining or
+once-repeating qualified lead is still ``handoff_ready`` (9 beats 10/11).
+
+Determinism: the policy is pure, synchronous Python over ``signals`` and
+``state``; no model output reaches it (``GuardrailSignals`` carries scores,
+counts and codes only, and the grounding verdict is computed by the
+validator, never read from the reply). Identical inputs always give an
+identical ``EscalationDecision``: candidates are sorted by ``(priority,
+code)`` and ``reason_codes`` is that sorted order.
 """
 
 from enum import Enum
@@ -229,21 +247,26 @@ class EscalationPolicy:
             candidates.append(
                 (6, EscalationAction.ESCALATE, "injection_repeated", UserMessageInstruction.OFFER_HUMAN_HANDOFF)
             )
+        # Slice 14: both refusals (7, 8) outrank the qualified-lead rule (9).
         if injection.internal_data_requested:
             code = "injection_secrets_requested" if injection.secrets_requested else "injection_internal_data_requested"
-            candidates.append((8, EscalationAction.REFUSE, code, UserMessageInstruction.PROVIDE_SAFE_REFUSAL))
+            candidates.append((7, EscalationAction.REFUSE, code, UserMessageInstruction.PROVIDE_SAFE_REFUSAL))
         else:
-            candidates.append((9, EscalationAction.REFUSE, "injection_attempt", UserMessageInstruction.PROVIDE_SAFE_REFUSAL))
+            candidates.append((8, EscalationAction.REFUSE, "injection_attempt", UserMessageInstruction.PROVIDE_SAFE_REFUSAL))
         return candidates
 
     @staticmethod
     def _qualified_lead_rule(state: ConversationState) -> List[_Candidate]:
-        """Deterministic qualification only: the model never declares this."""
+        """Deterministic qualification only: the model never declares this.
+
+        Rank 9 (Slice 14): below every escalation and every injection
+        refusal, so qualification state can never bypass a security rule.
+        """
         if state.qualification == QualificationState.HANDOFF_READY:
-            return [(7, EscalationAction.HANDOFF_READY, "handoff_ready", UserMessageInstruction.OFFER_HUMAN_HANDOFF)]
+            return [(9, EscalationAction.HANDOFF_READY, "handoff_ready", UserMessageInstruction.OFFER_HUMAN_HANDOFF)]
         if state.qualification != QualificationState.QUALIFIED or not state.lead.is_complete():
             return []
-        return [(7, EscalationAction.HANDOFF_READY, "lead_qualified", UserMessageInstruction.OFFER_HUMAN_HANDOFF)]
+        return [(9, EscalationAction.HANDOFF_READY, "lead_qualified", UserMessageInstruction.OFFER_HUMAN_HANDOFF)]
 
 
 __all__ = [
