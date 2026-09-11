@@ -65,6 +65,28 @@ Guardrails + escalation (Milestone 2, Slice 10):
   qualification-policy slice; Python state stays authoritative either way.
 - Fail closed: a detector error skips the LLM for the turn (safe fallback),
   a policy error escalates, a validator error counts as ungrounded.
+
+Human handoff (Milestone 2, Slice 12):
+- An optional ``HandoffSink`` (``app.agent.handoff``) is injected through
+  the constructor; there is no module-level sink. ``EscalationPolicy``
+  stays the decision maker and the sink stays the delivery/storage
+  boundary; the orchestrator only carries the *applied* decision across.
+- Exactly one submission point per turn: after the reply is final and the
+  turn's messages are in ``history`` (so the human sees the triggering
+  message and our reply), before the state is saved. The request is built
+  only by ``handoff_request_from_decision``; it returns ``None`` for every
+  action that does not ask for a human, so no second action table lives
+  here. ``escalate`` yields an ``escalation`` handoff, ``handoff_ready`` a
+  ``qualified_lead`` handoff; the model reply for ``handoff_ready`` still
+  goes out and qualification is not transitioned (Slice 10 semantics).
+- Deduplication belongs to the sink alone. The policy keeps returning
+  ``escalate`` for the life of an escalation; each such turn is submitted
+  once and the sink reports ``deduplicated``.
+- A sink that raises, rejects, or is absent never fails the turn: the
+  deterministic handoff reply still goes out, the existing state
+  transition (``mark_escalated``) still happens, diagnostics record the
+  outcome (``created``/``deduplicated``/``rejected``/``unavailable``) and
+  the exception type only. No retries within a turn.
 """
 
 import json
@@ -86,6 +108,7 @@ from app.agent.guardrails import (
     RepetitionDetector,
     apply_signals_to_flags,
 )
+from app.agent.handoff import HandoffResult, HandoffSink, handoff_request_from_decision
 from app.agent.prompts import PromptBuilder
 from app.agent.state import ConversationState, EscalationStatus, MAX_MESSAGE_LENGTH, ToolInvocation
 from app.agent.store import ConversationStore
@@ -189,6 +212,10 @@ EscalationStage = Literal["incoming", "outgoing"]
 ExtractionSource = Literal["model", "model_repaired", "fallback"]
 _EXTRACTION_SOURCES = ("model", "model_repaired", "fallback")
 
+# The sink's own ``HandoffOutcome`` values plus ``unavailable``: no sink is
+# configured, the sink raised, or it returned something unusable.
+HandoffOutcomeCode = Literal["created", "deduplicated", "rejected", "unavailable"]
+
 
 # ---------------------------------------------------------------------------
 # Result models
@@ -263,6 +290,15 @@ class TurnDiagnostics(BaseModel):
     escalation_stage: Optional[EscalationStage] = None
     policy_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
     reply_source: ReplySource = "model"
+    # Human handoff (outcome codes and the sink's opaque ID only; never the
+    # request payload, which carries the transcript and lead details).
+    handoff_attempted: bool = Field(False, description="A request was submitted to a configured sink")
+    handoff_accepted: bool = False
+    handoff_outcome: Optional[HandoffOutcomeCode] = None
+    handoff_id: Optional[str] = Field(None, description="Sink-assigned correlation ID; never shown to the customer")
+    handoff_kind: Optional[str] = None
+    handoff_priority: Optional[str] = None
+    handoff_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
 
 
 class AgentTurnResult(BaseModel):
@@ -324,6 +360,18 @@ class _TurnContext:
     policy_error_type: Optional[str] = None
     reply_source: ReplySource = "model"
     fallback_reason: Optional[FallbackReason] = None
+    # Human handoff. ``applied_decision`` is the one decision this turn acted
+    # on (set by ``_apply_decision``); it is handed to the adapter exactly
+    # once, after the reply is final. The adapter decides whether it warrants
+    # a handoff at all.
+    applied_decision: Optional[EscalationDecision] = None
+    handoff_attempted: bool = False
+    handoff_accepted: bool = False
+    handoff_outcome: Optional[HandoffOutcomeCode] = None
+    handoff_id: Optional[str] = None
+    handoff_kind: Optional[str] = None
+    handoff_priority: Optional[str] = None
+    handoff_error_type: Optional[str] = None
 
     @property
     def invalid_input_budget_exhausted(self) -> bool:
@@ -419,7 +467,9 @@ class AgentOrchestrator:
     prompt text comes from ``PromptBuilder``, lead data comes only from the
     optional ``LeadExtractor`` (merged through ``ConversationState``), and
     every safety verdict comes from the pure detectors and
-    ``EscalationPolicy``; this class only applies them.
+    ``EscalationPolicy``; this class only applies them. When the policy asks
+    for a human, the optional ``HandoffSink`` receives the request; the
+    orchestrator never decides that on its own.
     """
 
     def __init__(
@@ -436,6 +486,7 @@ class AgentOrchestrator:
         anger: Optional[AngerScorer] = None,
         repetition: Optional[RepetitionDetector] = None,
         human_request: Optional[HumanRequestDetector] = None,
+        handoff_sink: Optional[HandoffSink] = None,
     ):
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must not be negative")
@@ -446,6 +497,10 @@ class AgentOrchestrator:
         self._max_tool_rounds = max_tool_rounds
         # ``None`` disables lead extraction; the turn then runs exactly as in Slice 6.
         self._extractor = extractor
+        # ``None`` means escalations are recorded in state only and reported
+        # as ``unavailable``; the caller owns the sink, this module holds no
+        # default instance.
+        self._handoff_sink = handoff_sink
         # Guardrails and policy are always on; the arguments exist so tests
         # can substitute instrumented or failing components.
         self._policy = policy if policy is not None else EscalationPolicy()
@@ -538,15 +593,22 @@ class AgentOrchestrator:
                 ctx.fallback_reason = "llm_error"
                 loop_exit = "llm_error"
 
-        # 13. Persist: this turn's messages, tool history, flags and any other state changes.
+        # 13. This turn's messages go into history first so a handoff carries
+        #     the triggering message and our reply in its transcript.
         state.add_user_message(customer_text)
         state.add_assistant_message(reply_text)
+
+        # 14. Human handoff for the decision this turn applied, if it asked
+        #     for one. Exactly one submission per turn; never raises.
+        self._submit_handoff(ctx, masked_sender, turn)
+
+        # 15. Persist: messages, tool history, flags, escalation and lead state.
         self._store.save(state)
 
         diagnostics = self._diagnostics(ctx, masked_sender, message_id, turn, loop_exit, error_type)
         logger.info(
             "Agent turn complete for %s: turn=%d llm_calls=%d tool_rounds=%d tool_calls=%d exit=%s fallback=%s "
-            "extraction=%s qualification=%s escalation=%s/%s grounding_violations=%d reply_source=%s",
+            "extraction=%s qualification=%s escalation=%s/%s grounding_violations=%d reply_source=%s handoff=%s",
             masked_sender,
             turn,
             diagnostics.llm_calls,
@@ -560,9 +622,10 @@ class AgentOrchestrator:
             diagnostics.escalation_stage,
             diagnostics.grounding_violation_count,
             diagnostics.reply_source,
+            diagnostics.handoff_outcome or "none",
         )
 
-        # 14. Structured result.
+        # 16. Structured result.
         return AgentTurnResult(
             reply_text=reply_text,
             state_snapshot=state.model_copy(deep=True),
@@ -626,11 +689,79 @@ class AgentOrchestrator:
         return decision
 
     def _apply_decision(self, ctx: _TurnContext, decision: EscalationDecision) -> None:
-        """Apply the state transition a decision implies. Python only; never the model."""
+        """Apply the state transition a decision implies. Python only; never the model.
+
+        Called once per turn, with the decision the turn acts on; that
+        decision is also what ``_submit_handoff`` hands to the adapter later.
+        """
         if decision.action == EscalationAction.ESCALATE and ctx.state.escalation.status == EscalationStatus.NONE:
             ctx.state.mark_escalated(_escalation_reason(decision))
         # ``handoff_ready`` is reported, not transitioned: ``mark_handoff_ready``
-        # is an explicit consent step owned by a later slice.
+        # is an explicit consent step owned by a later slice, and a sink
+        # accepting a request is not a human taking over (``mark_handed_off``).
+        ctx.applied_decision = decision
+
+    # -- Human handoff ------------------------------------------------------
+
+    def _submit_handoff(self, ctx: _TurnContext, masked_sender: str, turn: int) -> None:
+        """Hand the applied decision to the sink if it asks for a human. Never raises.
+
+        The adapter (``handoff_request_from_decision``) decides whether the
+        decision warrants a request at all and builds the whole payload;
+        the sink owns deduplication. This method submits at most once and
+        never retries: a failure is contained, recorded by exception type,
+        and the turn's deterministic reply and state transition stand.
+        """
+        decision = ctx.applied_decision
+        if decision is None:
+            return  # a guardrail/LLM failure ended the turn before any decision was applied
+        try:
+            request = handoff_request_from_decision(decision, ctx.state)
+        except Exception as exc:  # the adapter is pure; a crash is a bug, not the customer's problem
+            ctx.handoff_outcome = "unavailable"
+            ctx.handoff_error_type = type(exc).__name__
+            logger.error("Handoff request build failed for %s (turn %d): %s", masked_sender, turn, ctx.handoff_error_type)
+            logger.debug("Handoff request build failure detail", exc_info=exc)
+            return
+        if request is None:
+            return  # the policy did not ask for a human
+
+        ctx.handoff_kind = request.kind.value
+        ctx.handoff_priority = request.priority.value
+        if self._handoff_sink is None:
+            ctx.handoff_outcome = "unavailable"
+            logger.warning(
+                "No handoff sink configured: %s handoff for %s (turn %d) is recorded in state only",
+                ctx.handoff_kind,
+                masked_sender,
+                turn,
+            )
+            return
+
+        ctx.handoff_attempted = True
+        try:
+            result = self._handoff_sink.submit(request)
+            if not isinstance(result, HandoffResult):
+                raise TypeError("handoff sink returned a non-HandoffResult")
+        except Exception as exc:  # transport or programming failure: contain, never expose
+            ctx.handoff_outcome = "unavailable"
+            ctx.handoff_error_type = type(exc).__name__
+            logger.error("Handoff submission failed for %s (turn %d): %s", masked_sender, turn, ctx.handoff_error_type)
+            logger.debug("Handoff submission failure detail", exc_info=exc)
+            return
+
+        ctx.handoff_accepted = result.accepted
+        ctx.handoff_outcome = result.outcome.value
+        ctx.handoff_id = result.handoff_id
+        logger.info(
+            "Handoff %s for %s (turn %d): kind=%s priority=%s id=%s",
+            ctx.handoff_outcome,
+            masked_sender,
+            turn,
+            ctx.handoff_kind,
+            ctx.handoff_priority,
+            ctx.handoff_id,
+        )
 
     # -- Lead extraction ----------------------------------------------------
 
@@ -698,7 +829,13 @@ class AgentOrchestrator:
             ctx.reply_source = "model"
             return candidate, loop_exit
 
-        for _ in range(MAX_CORRECTIVE_GENERATIONS):
+        # A rewrite can only cure a grounding problem (``suppress``). Any other
+        # blocking verdict on the outgoing stage (``escalate`` on a policy
+        # error, for instance) does not depend on the candidate text, so a
+        # rewrite could not change it: skip the model call and go straight
+        # to the deterministic reply.
+        rewrite_may_help = ctx.decision is not None and ctx.decision.action == EscalationAction.SUPPRESS
+        for _ in range(MAX_CORRECTIVE_GENERATIONS if rewrite_may_help else 0):
             if ctx.grounding_error_type is not None:
                 break  # a broken validator cannot approve a rewrite either
             ctx.corrective_generation_attempted = True
@@ -1020,6 +1157,13 @@ class AgentOrchestrator:
             escalation_stage=ctx.decision_stage,
             policy_error_type=ctx.policy_error_type,
             reply_source=ctx.reply_source,
+            handoff_attempted=ctx.handoff_attempted,
+            handoff_accepted=ctx.handoff_accepted,
+            handoff_outcome=ctx.handoff_outcome,
+            handoff_id=ctx.handoff_id,
+            handoff_kind=ctx.handoff_kind,
+            handoff_priority=ctx.handoff_priority,
+            handoff_error_type=ctx.handoff_error_type,
         )
 
 

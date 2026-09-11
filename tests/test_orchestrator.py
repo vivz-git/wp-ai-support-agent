@@ -2536,3 +2536,1008 @@ def test_guardrail_integration_is_not_wired_into_app_main():
     main_source = inspect.getsource(main_module)
     for symbol in ("EscalationPolicy", "GroundingValidator", "InjectionDetector", "guardrails", "escalation"):
         assert symbol not in main_source
+
+
+# ===========================================================================
+# Milestone 2, Slice 12: human handoff integration
+# ===========================================================================
+#
+# Every test below uses the real ``InMemoryHandoffSink`` (or a small duck-typed
+# sink that counts, rejects, or fails), the real detectors, the real
+# ``EscalationPolicy`` and the real adapter ``handoff_request_from_decision``
+# over the same scripted LLM and in-memory store as above. No Groq, WhatsApp,
+# Meta, Slack, CRM, e-mail or ticketing calls anywhere.
+
+from app.agent import orchestrator as orchestrator_module  # noqa: E402
+from app.agent.escalation import EscalationDecision, UserMessageInstruction  # noqa: E402
+from app.agent.handoff import (  # noqa: E402
+    HandoffKind,
+    HandoffOutcome,
+    HandoffPriority,
+    HandoffRequest,
+    HandoffResult,
+    HandoffSinkError,
+    HandoffStatus,
+    InMemoryHandoffSink,
+    conversation_id_for,
+)
+
+SINK_SECRET = "Bearer mock_groq_api_key_67890"
+
+
+class CountingSink:
+    """The real in-memory sink, counting ``submit`` calls and keeping each request."""
+
+    def __init__(self):
+        self.inner = InMemoryHandoffSink()
+        self.requests: List[HandoffRequest] = []
+
+    def submit(self, request):
+        self.requests.append(request)
+        return self.inner.submit(request)
+
+    def __len__(self):
+        return len(self.inner)
+
+    def list(self, **kwargs):
+        return self.inner.list(**kwargs)
+
+    def get(self, handoff_id):
+        return self.inner.get(handoff_id)
+
+    def close(self, handoff_id):
+        return self.inner.close(handoff_id)
+
+
+class FailingSink:
+    """A sink whose transport is down. Must never fail the customer turn."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls = 0
+
+    def submit(self, request):
+        self.calls += 1
+        raise self._exc
+
+
+class RejectingSink:
+    def __init__(self):
+        self.calls = 0
+
+    def submit(self, request):
+        self.calls += 1
+        return HandoffResult(accepted=False, outcome=HandoffOutcome.REJECTED, reason="sink_full")
+
+
+class BadResultSink:
+    def submit(self, request):
+        return {"accepted": True, "handoff_id": "ho-bogus"}
+
+
+class EscalateOnUngroundedPolicy(EscalationPolicy):
+    """Real policy, except an ungrounded candidate routes to a human instead of a rewrite."""
+
+    def evaluate(self, signals, state):
+        decision = super().evaluate(signals, state)
+        if decision.action == EscalationAction.SUPPRESS:
+            return EscalationDecision(
+                action=EscalationAction.ESCALATE,
+                reason_codes=["grounding_violation", "escalate_on_ungrounded"],
+                user_message_instruction=UserMessageInstruction.OFFER_HUMAN_HANDOFF,
+                priority=1,
+            )
+        return decision
+
+
+def make_with_sink(llm, knowledge, store, sink, tools: Optional[ToolRegistry] = None, **kwargs) -> AgentOrchestrator:
+    return make(llm, knowledge, store, tools=tools, handoff_sink=sink, **kwargs)
+
+
+def _only_record(sink):
+    records = sink.list()
+    assert len(records) == 1
+    return records[0]
+
+
+def _assert_no_handoff(result: AgentTurnResult, sink) -> None:
+    assert len(sink) == 0
+    d = result.diagnostics
+    assert d.handoff_attempted is False
+    assert d.handoff_accepted is False
+    assert d.handoff_outcome is None
+    assert d.handoff_id is None
+    assert d.handoff_kind is None
+    assert d.handoff_priority is None
+    assert d.handoff_error_type is None
+
+
+# ---------------------------------------------------------------------------
+# 1, 2, 3, 17, 40. Human request creates a handoff, no LLM, deterministic reply
+# ---------------------------------------------------------------------------
+
+
+def test_human_request_creates_escalation_handoff_without_llm(knowledge, store):
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM([text("I am a human, how can I help?")])  # never consulted
+    extractor = RaisingExtractor(RuntimeError("must not run"))
+    result = run(make_with_sink(llm, knowledge, store, sink, extractor=extractor), HUMAN_MSG)
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert llm.calls == []
+    assert extractor.calls == 0
+
+    record = _only_record(sink)
+    request = record.request
+    assert request.kind == HandoffKind.ESCALATION
+    assert request.priority == HandoffPriority.HIGH
+    assert request.reason_codes == ["human_requested"]
+    assert request.policy_priority == 3
+    assert request.conversation_id == conversation_id_for(SENDER)
+    assert request.sender_masked == "********3210"
+    assert request.turn == 1
+    assert record.status == HandoffStatus.PENDING
+    assert record.submission_count == 1
+    # The human sees the triggering message and our reply, nothing else.
+    assert [(e.role, e.content) for e in request.transcript] == [
+        ("customer", HUMAN_MSG),
+        ("assistant", HUMAN_HANDOFF_REPLY),
+    ]
+    assert request.lead.qualification == "escalated"
+
+    d = result.diagnostics
+    assert d.escalation_action == "escalate"
+    assert d.escalation_stage == "incoming"
+    assert d.reply_source == "policy"
+    assert d.handoff_attempted is True
+    assert d.handoff_accepted is True
+    assert d.handoff_outcome == "created"
+    assert d.handoff_id == record.handoff_id
+    assert d.handoff_kind == "escalation"
+    assert d.handoff_priority == "high"
+    assert d.handoff_error_type is None
+
+
+def test_handoff_reply_is_deterministic_and_exposes_no_internal_identifiers(knowledge, store):
+    sink = InMemoryHandoffSink()
+    orchestrator = make_with_sink(ScriptedLLM([]), knowledge, store, sink)
+    replies = [run(orchestrator, HUMAN_MSG).reply_text, run(orchestrator, "hello?").reply_text]
+    other = run(orchestrator, ANGRY_COMPLAINT_MSG, sender=OTHER_SENDER).reply_text
+
+    assert replies == [HUMAN_HANDOFF_REPLY, HUMAN_HANDOFF_REPLY]
+    assert other == HUMAN_HANDOFF_REPLY
+    handoff_id = sink.list()[0].handoff_id
+    for reply in replies + [other]:
+        lowered = reply.lower()
+        assert handoff_id not in reply
+        assert "ho-" not in reply and "conv_" not in reply
+        for forbidden in ("escalat", "policy", "handoff", "sink", "priority", "product_lookup", "inmemory", "error"):
+            assert forbidden not in lowered
+        for var in _SECRET_ENV_VARS:
+            assert os.environ[var] not in reply
+    assert store.get(SENDER).history[-1].content == HUMAN_HANDOFF_REPLY
+
+
+# ---------------------------------------------------------------------------
+# 4. Normal messages never create a handoff
+# ---------------------------------------------------------------------------
+
+
+def test_normal_faq_and_product_flow_creates_no_handoff(knowledge, store):
+    sink = CountingSink()
+    llm = ScriptedLLM([text("We're open 9am-7pm every day."), tool_calls(call("call_1")), text("Yes! Our Ethiopia roast is in stock.")])
+    orchestrator = make_with_sink(llm, knowledge, store, sink)
+
+    faq = run(orchestrator, "What are your hours?")
+    product = run(orchestrator, "Do you have Ethiopia?")
+
+    assert faq.reply_text == "We're open 9am-7pm every day."
+    assert product.reply_text == "Yes! Our Ethiopia roast is in stock."
+    assert product.tool_calls[0].status == "ok"
+    assert product.diagnostics.llm_calls == 2
+    assert sink.requests == []
+    for result in (faq, product):
+        assert result.diagnostics.escalation_action == "continue"
+        _assert_no_handoff(result, sink)
+    assert store.get(SENDER).escalation.status == EscalationStatus.NONE
+
+
+# ---------------------------------------------------------------------------
+# 5, 6, 7. Anger and repetition follow the policy; only escalations hand off
+# ---------------------------------------------------------------------------
+
+
+def test_high_anger_complaint_creates_urgent_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM([text("model text")])
+    result = run(make_with_sink(llm, knowledge, store, sink), ANGRY_COMPLAINT_MSG)
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert llm.calls == []
+    request = _only_record(sink).request
+    assert request.kind == HandoffKind.ESCALATION
+    assert request.reason_codes == ["high_anger_complaint"]
+    assert request.priority == HandoffPriority.URGENT
+    assert result.diagnostics.handoff_priority == "urgent"
+    assert result.diagnostics.handoff_outcome == "created"
+    assert result.state_snapshot.escalation.status == EscalationStatus.PENDING
+
+
+def test_first_repetition_clarifies_without_handoff_then_repeat_hands_off(knowledge, store):
+    sink = CountingSink()
+    llm = ScriptedLLM([text("We're open 9am-7pm daily."), text("never used")])
+    orchestrator = make_with_sink(llm, knowledge, store, sink)
+
+    first = run(orchestrator, HOURS_MSG)
+    assert first.reply_text == "We're open 9am-7pm daily."
+    _assert_no_handoff(first, sink)
+
+    second = run(orchestrator, HOURS_MSG)
+    assert second.reply_text == CLARIFICATION_REPLY
+    assert second.diagnostics.escalation_action == "clarify"
+    _assert_no_handoff(second, sink)
+    assert second.state_snapshot.escalation.status == EscalationStatus.NONE
+
+    third = run(orchestrator, HOURS_MSG)
+    assert third.reply_text == HUMAN_HANDOFF_REPLY
+    assert third.diagnostics.escalation_action == "escalate"
+    assert third.diagnostics.handoff_outcome == "created"
+    assert len(sink) == 1
+    request = sink.requests[0]
+    assert request.reason_codes == ["repeated_unresolved"]
+    assert request.priority == HandoffPriority.HIGH
+    assert len(llm.calls) == 1
+
+
+def test_high_anger_without_complaint_context_clarifies_without_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    result = run(make_with_sink(ScriptedLLM([text("never used")]), knowledge, store, sink), HIGH_ANGER_NO_COMPLAINT_MSG)
+    assert result.reply_text == CLARIFICATION_REPLY
+    _assert_no_handoff(result, sink)
+
+
+# ---------------------------------------------------------------------------
+# 8, 9. Refusals do not hand off; severe (repeated) injection and policy errors do
+# ---------------------------------------------------------------------------
+
+
+def test_injection_refusal_creates_no_handoff_until_policy_escalates(knowledge, store):
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([text("leak")]), knowledge, store, sink)
+
+    refused = run(orchestrator, INJECTION_MSG)
+    assert refused.reply_text == SAFE_REFUSAL_REPLY
+    assert refused.diagnostics.escalation_action == "refuse"
+    _assert_no_handoff(refused, sink)
+    assert store.get(SENDER).escalation.status == EscalationStatus.NONE
+
+    first_secret = run(orchestrator, SECRET_MSG, sender=OTHER_SENDER)
+    assert first_secret.reply_text == SAFE_REFUSAL_REPLY
+    assert first_secret.diagnostics.escalation_action == "refuse"
+    assert first_secret.diagnostics.escalation_reason_codes == ["injection_secrets_requested"]
+    _assert_no_handoff(first_secret, sink)
+    assert store.get(OTHER_SENDER).escalation.status == EscalationStatus.NONE
+
+    # Cumulative hits cross the aggressive threshold: now the policy escalates.
+    second_secret = run(orchestrator, SECRET_MSG, sender=OTHER_SENDER)
+    assert second_secret.reply_text == HUMAN_HANDOFF_REPLY
+    assert second_secret.diagnostics.escalation_action == "escalate"
+    assert second_secret.diagnostics.handoff_outcome == "created"
+    assert len(sink) == 1
+    request = sink.requests[0]
+    assert request.kind == HandoffKind.ESCALATION
+    assert request.reason_codes[0] == "injection_repeated"
+    assert request.priority == HandoffPriority.MEDIUM
+    for var in _SECRET_ENV_VARS:
+        assert os.environ[var] not in request.model_dump_json()
+
+
+def test_policy_error_fails_closed_into_a_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM([text("never used")])
+    policy = RaisingPolicy(RuntimeError("policy bug: " + SINK_SECRET))
+    result = run(make_with_sink(llm, knowledge, store, sink, policy=policy), "hello there")
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert llm.calls == []
+    request = _only_record(sink).request
+    assert request.kind == HandoffKind.ESCALATION
+    assert request.reason_codes == ["policy_error"]
+    assert request.priority == HandoffPriority.MEDIUM  # unknown code: kind default
+    assert result.diagnostics.handoff_outcome == "created"
+    assert result.diagnostics.policy_error_type == "RuntimeError"
+    assert "policy bug" not in request.model_dump_json()
+    assert SINK_SECRET not in request.model_dump_json()
+    assert store.get(SENDER).escalation.reason == "policy_error"
+
+
+# ---------------------------------------------------------------------------
+# 10, 11. Qualified leads
+# ---------------------------------------------------------------------------
+
+
+def test_qualified_complete_lead_creates_qualified_lead_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    agent_llm = ScriptedLLM([text("Great, thanks Rahul!")])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+    result = run(orchestrator, "Rahul from Bean House")
+
+    # Slice 10 semantics intact: the grounded model reply goes out and
+    # qualification stays Python-computed (not transitioned).
+    assert result.reply_text == "Great, thanks Rahul!"
+    assert result.diagnostics.escalation_action == "handoff_ready"
+    assert result.diagnostics.escalation_stage == "outgoing"
+    state = result.state_snapshot
+    assert state.qualification == QualificationState.QUALIFIED
+    assert state.escalation.status == EscalationStatus.NONE
+
+    record = _only_record(sink)
+    request = record.request
+    assert request.kind == HandoffKind.QUALIFIED_LEAD
+    assert request.reason_codes == ["lead_qualified"]
+    assert request.priority == HandoffPriority.LOW
+    assert request.policy_priority == 7
+    assert request.lead.qualification == "qualified"
+    assert request.lead.lead_track == "wholesale"
+    assert request.lead.contact_name == "Rahul"
+    assert request.lead.business_name == "Bean House"
+    assert request.lead.missing_required_fields == []
+    assert [e.role for e in request.transcript] == ["customer", "assistant"]
+    d = result.diagnostics
+    assert d.handoff_attempted is True
+    assert d.handoff_accepted is True
+    assert d.handoff_outcome == "created"
+    assert d.handoff_kind == "qualified_lead"
+    assert d.handoff_priority == "low"
+    assert d.handoff_id == record.handoff_id
+    assert store.get(SENDER).qualification == QualificationState.QUALIFIED
+
+
+def test_incomplete_qualified_state_creates_no_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    agent_llm = ScriptedLLM([text("Thanks Rahul, what volume do you need?")])
+    extractor_llm = ScriptedLLM([extraction_payload(track="wholesale", contact_name="Rahul", business_name="Bean House")])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+    result = run(orchestrator, "Rahul from Bean House")
+
+    assert result.reply_text == "Thanks Rahul, what volume do you need?"
+    assert result.state_snapshot.lead.contact_name == "Rahul"
+    assert result.state_snapshot.lead.is_complete() is False
+    assert result.state_snapshot.qualification not in (QualificationState.QUALIFIED, QualificationState.HANDOFF_READY)
+    assert result.diagnostics.escalation_action == "continue"
+    _assert_no_handoff(result, sink)
+
+
+def test_qualified_lead_handoff_is_not_resubmitted_as_a_new_ticket(knowledge, store):
+    sink = CountingSink()
+    agent_llm = ScriptedLLM([text("Great, thanks Rahul!"), text("Sure, we're open 9am-7pm.")])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL), extraction_payload()])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+
+    first = run(orchestrator, "Rahul from Bean House")
+    second = run(orchestrator, "and your hours?")
+
+    assert first.diagnostics.handoff_outcome == "created"
+    assert second.reply_text == "Sure, we're open 9am-7pm."
+    assert second.diagnostics.escalation_action == "handoff_ready"
+    assert second.diagnostics.handoff_outcome == "deduplicated"
+    assert second.diagnostics.handoff_id == first.diagnostics.handoff_id
+    assert len(sink) == 1
+    assert sink.list()[0].submission_count == 2
+    assert all(r.kind == HandoffKind.QUALIFIED_LEAD for r in sink.requests)
+    assert store.get(SENDER).qualification == QualificationState.QUALIFIED
+
+
+# ---------------------------------------------------------------------------
+# 12, 13, 18. Deduplication belongs to the sink; kinds stay distinct
+# ---------------------------------------------------------------------------
+
+
+def test_same_escalation_deduplicates_through_the_sink(knowledge, store):
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([text("never used")]), knowledge, store, sink)
+
+    first = run(orchestrator, HUMAN_MSG)
+    second = run(orchestrator, "ok, what are your hours?")
+    third = run(orchestrator, "hello??")
+
+    assert [r.reply_text for r in (first, second, third)] == [HUMAN_HANDOFF_REPLY] * 3
+    assert [r.diagnostics.handoff_outcome for r in (first, second, third)] == ["created", "deduplicated", "deduplicated"]
+    assert first.diagnostics.handoff_id == second.diagnostics.handoff_id == third.diagnostics.handoff_id
+    assert all(r.diagnostics.handoff_accepted for r in (first, second, third))
+    # The orchestrator submitted every turn; the sink kept one ticket.
+    assert len(sink.requests) == 3
+    assert len(sink) == 1
+    record = sink.list()[0]
+    assert record.submission_count == 3
+    assert record.request.reason_codes == ["human_requested"]  # the original ticket, not re-keyed
+    assert sink.requests[1].reason_codes == ["already_escalated"]
+    assert store.get(SENDER).escalation.requested_at_turn == 1
+
+
+def test_orchestrator_does_not_duplicate_sink_dedupe_logic(knowledge, store):
+    source = inspect.getsource(orchestrator_module)
+    for forbidden in ("dedupe_key", "open_handoff_for", "_open_by_key", "submitted_handoffs", "handoff_ids"):
+        assert forbidden not in source
+    # Behaviourally: once the sink closes the ticket, the next turn opens a new one,
+    # which only works if the orchestrator remembers nothing about prior submissions.
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([]), knowledge, store, sink)
+    first = run(orchestrator, HUMAN_MSG)
+    sink.close(first.diagnostics.handoff_id)
+    second = run(orchestrator, "still there?")
+    assert second.diagnostics.handoff_outcome == "created"
+    assert second.diagnostics.handoff_id != first.diagnostics.handoff_id
+    assert len(sink) == 2
+
+
+def test_different_handoff_kinds_remain_distinct(knowledge, store):
+    sink = CountingSink()
+    agent_llm = ScriptedLLM([text("Great, thanks Rahul!")])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+
+    lead_turn = run(orchestrator, "Rahul from Bean House")
+    human_turn = run(orchestrator, HUMAN_MSG)
+
+    assert lead_turn.diagnostics.handoff_kind == "qualified_lead"
+    assert human_turn.diagnostics.handoff_kind == "escalation"
+    assert human_turn.diagnostics.handoff_outcome == "created"
+    assert human_turn.diagnostics.handoff_id != lead_turn.diagnostics.handoff_id
+    records = sink.list()
+    assert [r.request.kind for r in records] == [HandoffKind.QUALIFIED_LEAD, HandoffKind.ESCALATION]
+    assert all(r.submission_count == 1 for r in records)
+    assert records[0].request.conversation_id == records[1].request.conversation_id
+    assert store.get(SENDER).qualification == QualificationState.ESCALATED
+
+
+# ---------------------------------------------------------------------------
+# 14, 15, 39. Sink failure is non-fatal, safe, and never retried
+# ---------------------------------------------------------------------------
+
+
+def test_sink_failure_is_non_fatal_and_produces_safe_fallback(knowledge, store):
+    sink = FailingSink(HandoffSinkError("provider down: " + SINK_SECRET))
+    llm = ScriptedLLM([text("never used")])
+    result = run(make_with_sink(llm, knowledge, store, sink), HUMAN_MSG)
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert llm.calls == []
+    assert sink.calls == 1  # exactly one attempt, no retry
+    d = result.diagnostics
+    assert d.handoff_attempted is True
+    assert d.handoff_accepted is False
+    assert d.handoff_outcome == "unavailable"
+    assert d.handoff_id is None
+    assert d.handoff_kind == "escalation"
+    assert d.handoff_error_type == "HandoffSinkError"
+    blob = json.dumps(d.model_dump())
+    assert "provider down" not in blob and SINK_SECRET not in blob
+    # The escalation still stands in persisted state.
+    saved = store.get(SENDER)
+    assert saved.escalation.status == EscalationStatus.PENDING
+    assert saved.qualification == QualificationState.ESCALATED
+    assert saved.history[-1].content == HUMAN_HANDOFF_REPLY
+    assert saved.model_dump(mode="json") == result.state_snapshot.model_dump(mode="json")
+
+
+def test_unexpected_sink_exception_is_also_contained(knowledge, store):
+    sink = FailingSink(ZeroDivisionError("sink bug"))
+    result = run(make_with_sink(ScriptedLLM([]), knowledge, store, sink), ANGRY_COMPLAINT_MSG)
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert sink.calls == 1
+    assert result.diagnostics.handoff_outcome == "unavailable"
+    assert result.diagnostics.handoff_error_type == "ZeroDivisionError"
+    assert store.get(SENDER).escalation.status == EscalationStatus.PENDING
+
+
+def test_rejected_and_malformed_sink_results_are_contained(knowledge, store):
+    rejecting = RejectingSink()
+    rejected = run(make_with_sink(ScriptedLLM([]), knowledge, store, rejecting), HUMAN_MSG)
+    assert rejected.reply_text == HUMAN_HANDOFF_REPLY
+    assert rejecting.calls == 1
+    assert rejected.diagnostics.handoff_attempted is True
+    assert rejected.diagnostics.handoff_accepted is False
+    assert rejected.diagnostics.handoff_outcome == "rejected"
+    assert rejected.diagnostics.handoff_error_type is None
+
+    bogus = run(make_with_sink(ScriptedLLM([]), knowledge, store, BadResultSink()), HUMAN_MSG, sender=OTHER_SENDER)
+    assert bogus.reply_text == HUMAN_HANDOFF_REPLY
+    assert bogus.diagnostics.handoff_outcome == "unavailable"
+    assert bogus.diagnostics.handoff_error_type == "TypeError"
+    assert "ho-bogus" not in json.dumps(bogus.diagnostics.model_dump())
+    for sender in (SENDER, OTHER_SENDER):
+        assert store.get(sender).escalation.status == EscalationStatus.PENDING
+
+
+def test_sink_failure_does_not_prevent_a_later_successful_submission(knowledge, store):
+    # The escalation is sticky; the next turn re-submits once and succeeds.
+    failing = FailingSink(HandoffSinkError("down"))
+    first = run(make_with_sink(ScriptedLLM([]), knowledge, store, failing), HUMAN_MSG)
+    assert first.diagnostics.handoff_outcome == "unavailable"
+
+    healthy = InMemoryHandoffSink()
+    second = run(make_with_sink(ScriptedLLM([]), knowledge, store, healthy), "anyone there?")
+    assert second.reply_text == HUMAN_HANDOFF_REPLY
+    assert second.diagnostics.handoff_outcome == "created"
+    assert failing.calls == 1
+    assert _only_record(healthy).request.reason_codes == ["already_escalated"]
+
+
+# ---------------------------------------------------------------------------
+# 16, 37. The sink is injected; nothing global; optional
+# ---------------------------------------------------------------------------
+
+
+def test_sink_is_injected_per_orchestrator_not_global(knowledge, store):
+    sink_a, sink_b = InMemoryHandoffSink(), InMemoryHandoffSink()
+    run(make_with_sink(ScriptedLLM([]), knowledge, store, sink_a), HUMAN_MSG)
+    run(make_with_sink(ScriptedLLM([]), knowledge, ConversationStore(), sink_b), ANGRY_COMPLAINT_MSG, sender=OTHER_SENDER)
+
+    assert [r.request.reason_codes for r in sink_a.list()] == [["human_requested"]]
+    assert [r.request.reason_codes for r in sink_b.list()] == [["high_anger_complaint"]]
+
+    # No module-level sink instance and no default construction in the orchestrator.
+    for name, value in vars(orchestrator_module).items():
+        assert not isinstance(value, InMemoryHandoffSink), name
+    source = inspect.getsource(orchestrator_module)
+    assert "InMemoryHandoffSink" not in source
+    assert "handoff_sink: Optional[HandoffSink] = None" in source
+
+
+def test_no_sink_configured_records_escalation_in_state_only(knowledge, store):
+    llm = ScriptedLLM([text("never used")])
+    result = run(make(llm, knowledge, store), HUMAN_MSG)  # no handoff_sink argument at all
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert llm.calls == []
+    d = result.diagnostics
+    assert d.handoff_attempted is False
+    assert d.handoff_accepted is False
+    assert d.handoff_outcome == "unavailable"  # the absence is explicit, not silent
+    assert d.handoff_kind == "escalation"
+    assert d.handoff_priority == "high"
+    assert d.handoff_id is None
+    assert d.handoff_error_type is None
+    saved = store.get(SENDER)
+    assert saved.escalation.status == EscalationStatus.PENDING
+    assert saved.qualification == QualificationState.ESCALATED
+
+
+# ---------------------------------------------------------------------------
+# 17, 36. The request comes from the existing adapter, built nowhere else
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_request_is_built_by_the_existing_adapter(knowledge, store, monkeypatch):
+    calls: List[Dict[str, Any]] = []
+    real_adapter = orchestrator_module.handoff_request_from_decision
+
+    def spy(decision, state, now=None):
+        request = real_adapter(decision, state, now=now)
+        calls.append({"decision": decision, "state_turn": state.turn_count, "history_len": len(state.history), "request": request})
+        return request
+
+    monkeypatch.setattr(orchestrator_module, "handoff_request_from_decision", spy)
+    sink = CountingSink()
+    result = run(make_with_sink(ScriptedLLM([]), knowledge, store, sink), HUMAN_MSG)
+
+    assert len(calls) == 1
+    assert isinstance(calls[0]["decision"], EscalationDecision)
+    assert calls[0]["decision"].action == EscalationAction.ESCALATE
+    assert calls[0]["state_turn"] == 1
+    assert calls[0]["history_len"] == 2  # customer message + reply already in history
+    assert sink.requests == [calls[0]["request"]]
+    assert result.diagnostics.handoff_outcome == "created"
+
+    source = inspect.getsource(orchestrator_module)
+    assert source.count("handoff_request_from_decision(") == 1
+    for forbidden in ("HandoffRequest(", "LeadSnapshot", "TranscriptEntry", "HandoffKind.", "HandoffPriority."):
+        assert forbidden not in source
+
+
+def test_adapter_is_called_for_non_handoff_decisions_but_yields_nothing(knowledge, store, monkeypatch):
+    seen: List[str] = []
+    real_adapter = orchestrator_module.handoff_request_from_decision
+
+    def spy(decision, state, now=None):
+        seen.append(decision.action.value)
+        return real_adapter(decision, state, now=now)
+
+    monkeypatch.setattr(orchestrator_module, "handoff_request_from_decision", spy)
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([text("hi!")]), knowledge, store, sink)
+    run(orchestrator, "hello")
+    run(orchestrator, INJECTION_MSG)
+    run(orchestrator, HIGH_ANGER_NO_COMPLAINT_MSG)
+
+    # The adapter (not the orchestrator) filters these out: no second action table.
+    assert seen == ["continue", "refuse", "clarify"]
+    assert sink.requests == []
+
+
+# ---------------------------------------------------------------------------
+# 19, 20. State persists; transitions use the existing state API only
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_uses_existing_state_transitions_and_persists(knowledge, store, monkeypatch):
+    transitions: List[str] = []
+    real_mark_escalated = ConversationState.mark_escalated
+    real_mark_handed_off = ConversationState.mark_handed_off
+    real_mark_handoff_ready = ConversationState.mark_handoff_ready
+
+    def spy_escalated(self, reason):
+        transitions.append(f"mark_escalated:{reason}")
+        return real_mark_escalated(self, reason)
+
+    def spy_handed_off(self):
+        transitions.append("mark_handed_off")
+        return real_mark_handed_off(self)
+
+    def spy_handoff_ready(self):
+        transitions.append("mark_handoff_ready")
+        return real_mark_handoff_ready(self)
+
+    monkeypatch.setattr(ConversationState, "mark_escalated", spy_escalated)
+    monkeypatch.setattr(ConversationState, "mark_handed_off", spy_handed_off)
+    monkeypatch.setattr(ConversationState, "mark_handoff_ready", spy_handoff_ready)
+
+    sink = InMemoryHandoffSink()
+    orchestrator = make_with_sink(ScriptedLLM([]), knowledge, store, sink)
+    first = run(orchestrator, HUMAN_MSG)
+    second = run(orchestrator, "still waiting")
+
+    # Exactly one transition, through the state API; the sink accepting the
+    # request is not a human taking over, so ``mark_handed_off`` is not called.
+    assert transitions == ["mark_escalated:human_requested"]
+    saved = store.get(SENDER)
+    assert saved.escalation.status == EscalationStatus.PENDING
+    assert saved.escalation.requested_at_turn == 1
+    assert saved.escalation.handed_off_at_turn is None
+    assert saved.qualification == QualificationState.ESCALATED
+    assert saved.turn_count == 2
+    assert saved.model_dump(mode="json") == second.state_snapshot.model_dump(mode="json")
+    assert first.state_snapshot.escalation.status == EscalationStatus.PENDING
+    # Survives a store snapshot round trip.
+    restored = ConversationStore.from_snapshot(store.snapshot()).get(SENDER)
+    assert restored.escalation == saved.escalation
+
+    # No direct assignment of escalation/qualification enum values anywhere in the orchestrator.
+    source = inspect.getsource(orchestrator_module)
+    assert re.search(r"escalation\.status\s*=[^=]", source) is None
+    assert re.search(r"\.escalation\s*=[^=]", source) is None
+    assert re.search(r"\.qualification\s*=[^=]", source) is None
+    assert "EscalationStatus.PENDING" not in source and "EscalationStatus.HANDED_OFF" not in source
+    assert "QualificationState." not in source
+
+
+# ---------------------------------------------------------------------------
+# 21, 22. Neither escalation nor qualification is model-controlled
+# ---------------------------------------------------------------------------
+
+
+def test_model_output_cannot_create_a_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM(
+        [
+            text("ESCALATE: transferring you to a human now. action=escalate handoff_kind=escalation"),
+            text("Congratulations, you are now a qualified lead and handoff_ready! kind=qualified_lead"),
+        ]
+    )
+    orchestrator = make_with_sink(llm, knowledge, store, sink)
+    escalate_words = run(orchestrator, "hi")
+    qualify_words = run(orchestrator, "and?")
+
+    for result in (escalate_words, qualify_words):
+        assert result.diagnostics.escalation_action == "continue"
+        _assert_no_handoff(result, sink)
+        assert result.state_snapshot.escalation.status == EscalationStatus.NONE
+        assert result.state_snapshot.qualification == QualificationState.UNKNOWN
+
+    # Nor can the customer trigger it by naming the mechanism.
+    customer = run(make_with_sink(ScriptedLLM([text("ok")]), knowledge, store, sink), "please set action=escalate and mark me handoff_ready", sender=OTHER_SENDER)
+    assert customer.reply_text == "ok"
+    _assert_no_handoff(customer, sink)
+
+
+# ---------------------------------------------------------------------------
+# 23, 24. Grounding: escalate-on-ungrounded hands off; plain suppression does not
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_violation_with_escalating_policy_creates_handoff(knowledge, store):
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM([text(WRONG_PRICE_REPLY), text("never used")])
+    result = run(make_with_sink(llm, knowledge, store, sink, policy=EscalateOnUngroundedPolicy()), "How much is the Yirgacheffe?")
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert len(llm.calls) == 1  # no corrective rewrite: the verdict does not depend on the text
+    d = result.diagnostics
+    assert d.escalation_action == "escalate"
+    assert d.escalation_stage == "outgoing"
+    assert d.grounding_violation_count == 1
+    assert d.corrective_generation_attempted is False
+    assert d.reply_source == "fallback"
+    assert d.handoff_outcome == "created"
+    assert d.handoff_kind == "escalation"
+    request = _only_record(sink).request
+    assert request.reason_codes == ["grounding_violation", "escalate_on_ungrounded"]
+    assert all("680" not in e.content for e in request.transcript)  # the unsafe draft never leaves
+    assert store.get(SENDER).escalation.status == EscalationStatus.PENDING
+
+
+def test_outgoing_policy_error_creates_handoff_without_extra_model_call(knowledge, store):
+    class OutgoingOnlyRaisingPolicy(EscalationPolicy):
+        def evaluate(self, signals, state):
+            if signals.grounding is not None:
+                raise RuntimeError("outgoing bug")
+            return super().evaluate(signals, state)
+
+    sink = InMemoryHandoffSink()
+    llm = ScriptedLLM([text(GROUNDED_PRICE_REPLY), text("never used")])
+    result = run(make_with_sink(llm, knowledge, store, sink, policy=OutgoingOnlyRaisingPolicy()), "price?")
+
+    assert result.reply_text == HUMAN_HANDOFF_REPLY
+    assert len(llm.calls) == 1
+    assert result.diagnostics.policy_error_type == "RuntimeError"
+    assert result.diagnostics.handoff_outcome == "created"
+    assert _only_record(sink).request.reason_codes == ["policy_error"]
+
+
+def test_grounding_suppression_alone_creates_no_handoff(knowledge, store):
+    sink = CountingSink()
+    corrected = run(make_with_sink(ScriptedLLM([text(WRONG_PRICE_REPLY), text(SAFE_CORRECTED_REPLY)]), knowledge, store, sink), "price?")
+    assert corrected.reply_text == SAFE_CORRECTED_REPLY
+    assert corrected.diagnostics.reply_source == "model_corrected"
+    _assert_no_handoff(corrected, sink)
+
+    recovered = run(
+        make_with_sink(ScriptedLLM([text(WRONG_PRICE_REPLY), text(WRONG_ORIGIN_REPLY)]), knowledge, store, sink),
+        "Tell me about the Yirgacheffe",
+        sender=OTHER_SENDER,
+    )
+    assert recovered.reply_text == UNVERIFIED_RECOVERY_REPLY
+    assert recovered.diagnostics.escalation_action == "suppress"
+    assert recovered.diagnostics.fallback_reason == "ungrounded_reply"
+    _assert_no_handoff(recovered, sink)
+    assert sink.requests == []
+    for sender in (SENDER, OTHER_SENDER):
+        assert store.get(sender).escalation.status == EscalationStatus.NONE
+
+
+# ---------------------------------------------------------------------------
+# 25, 26, 27, 28. Existing flows intact with a sink configured
+# ---------------------------------------------------------------------------
+
+
+def test_tool_loop_and_final_text_only_call_remain_functional_with_sink(knowledge, store):
+    sink = CountingSink()
+    tool = scripted_tool("lookup", [OK_RESULT] * 2)
+    llm = ScriptedLLM([tool_calls(call("c1", "lookup", "{}")), tool_calls(call("c2", "lookup", "{}")), text("final")])
+    result = run(make_with_sink(llm, knowledge, store, sink, tools=registry_with(tool)), "hi")
+
+    assert result.reply_text == "final"
+    assert [r.disposition for r in result.tool_calls] == ["executed", "executed"]
+    assert result.diagnostics.tool_rounds == 2
+    assert result.diagnostics.final_call_tools_omitted is True
+    assert result.diagnostics.loop_exit == "tool_round_limit"
+    assert "tools" not in llm.calls[2]["kwargs"]
+    assert all("tool_choice" not in c["kwargs"] for c in llm.calls)
+    _assert_no_handoff(result, sink)
+
+
+def test_llm_and_tool_failures_still_fall_back_safely_without_handoff(knowledge, store):
+    sink = CountingSink()
+    failed = run(make_with_sink(ScriptedLLM([LLMProviderError("Groq down")]), knowledge, store, sink), "hello")
+    assert failed.reply_text == SAFE_FALLBACK_REPLY
+    assert failed.diagnostics.fallback_reason == "llm_error"
+    _assert_no_handoff(failed, sink)
+
+    tool = scripted_tool("lookup", [RuntimeError("catalog exploded")])
+    llm = ScriptedLLM([tool_calls(call("c1", "lookup", '{"q": "x"}')), text("Let me get the team to check.")])
+    tool_failed = run(make_with_sink(llm, knowledge, store, sink, tools=registry_with(tool)), "hi", sender=OTHER_SENDER)
+    assert tool_failed.reply_text == "Let me get the team to check."
+    assert tool_failed.tool_calls[0].status == "unavailable"
+    _assert_no_handoff(tool_failed, sink)
+
+
+def test_extraction_runs_once_for_normal_flow_and_not_on_immediate_escalation(knowledge, store):
+    sink = CountingSink()
+    tool = scripted_tool("lookup", [OK_RESULT, OK_RESULT])
+    agent_llm = ScriptedLLM([tool_calls(call("c1", "lookup", '{"q": "a"}')), tool_calls(call("c2", "lookup", '{"q": "b"}')), text("final")])
+    extractor_llm = ScriptedLLM([extraction_payload(contact_name="Rahul")])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, tools=registry_with(tool), handoff_sink=sink)
+
+    normal = run(orchestrator, "I'm Rahul, two things please")
+    assert normal.reply_text == "final"
+    assert len(extractor_llm.calls) == 1
+    assert normal.diagnostics.extraction_attempted is True
+    assert normal.state_snapshot.lead.contact_name == "Rahul"
+    _assert_no_handoff(normal, sink)
+
+    escalated = run(orchestrator, HUMAN_MSG)
+    assert escalated.reply_text == HUMAN_HANDOFF_REPLY
+    assert len(extractor_llm.calls) == 1  # not called again
+    assert escalated.diagnostics.extraction_attempted is False
+    assert escalated.diagnostics.handoff_outcome == "created"
+    assert sink.requests[0].lead.contact_name == "Rahul"  # earlier lead data reaches the human
+
+
+# ---------------------------------------------------------------------------
+# 29, 30. Guardrail flags persist; sender isolation
+# ---------------------------------------------------------------------------
+
+
+def test_guardrail_flags_persist_with_sink_configured(knowledge, store):
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([text("hello!"), text("ok")]), knowledge, store, sink)
+
+    run(orchestrator, INJECTION_MSG)
+    assert store.get(SENDER).flags.injection_hits == 1
+    run(orchestrator, MILD_ANGER_MSG)
+    assert store.get(SENDER).flags.anger_score == pytest.approx(0.3)
+    run(orchestrator, "thanks, that helps")
+    saved = store.get(SENDER)
+    assert saved.flags.anger_score == pytest.approx(0.15)
+    assert saved.flags.injection_suspected is True
+    assert saved.flags.injection_hits == 1
+    assert sink.requests == []
+
+
+def test_sender_isolation_for_handoffs(knowledge, store):
+    sink = CountingSink()
+    orchestrator = make_with_sink(ScriptedLLM([text("hours for B")]), knowledge, store, sink)
+
+    a = run(orchestrator, HUMAN_MSG, sender=SENDER)
+    b = run(orchestrator, HOURS_MSG, sender=OTHER_SENDER)
+
+    assert a.reply_text == HUMAN_HANDOFF_REPLY
+    assert b.reply_text == "hours for B"
+    assert b.diagnostics.escalation_action == "continue"
+    assert b.diagnostics.handoff_outcome is None
+    assert len(sink) == 1
+    record = sink.list()[0]
+    assert record.request.conversation_id == conversation_id_for(SENDER)
+    assert record.request.conversation_id != conversation_id_for(OTHER_SENDER)
+    assert OTHER_SENDER not in record.request.model_dump_json()
+    assert store.get(OTHER_SENDER).escalation.status == EscalationStatus.NONE
+    assert store.get(SENDER).escalation.status == EscalationStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# 31, 32, 33. Safe diagnostics, no secrets, no network
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_diagnostics_are_safe(knowledge, store):
+    sink = InMemoryHandoffSink()
+    agent_llm = ScriptedLLM([text("Great, thanks Rahul!")])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+    lead_turn = run(orchestrator, "I'm Rahul from Bean House in Bengaluru", message_id="wamid.L")
+    human_turn = run(orchestrator, HUMAN_MSG + " my number is " + SENDER, message_id="wamid.H")
+    failed_turn = run(make_with_sink(ScriptedLLM([]), knowledge, store, FailingSink(HandoffSinkError(SINK_SECRET))), HUMAN_MSG, sender=OTHER_SENDER)
+
+    for result in (lead_turn, human_turn, failed_turn):
+        d = result.diagnostics
+        blob = json.dumps(d.model_dump())
+        assert SENDER not in blob and OTHER_SENDER not in blob
+        assert d.sender in ("********3210", "********2109")
+        for var in _SECRET_ENV_VARS:
+            assert os.environ[var] not in blob
+        assert "Bearer" not in blob and "Authorization" not in blob and SINK_SECRET not in blob
+        # No request payload: no lead values, no transcript, no customer text.
+        assert "Rahul" not in blob and "Bean House" not in blob and "Bengaluru" not in blob
+        assert "transcript" not in blob and "summary" not in blob
+        assert HUMAN_MSG not in blob and "<customer_message>" not in blob
+        assert "product_lookup" not in blob
+        json.dumps(result.model_dump(mode="json"))
+        assert set(TurnDiagnostics.model_fields) >= {
+            "handoff_attempted", "handoff_accepted", "handoff_outcome", "handoff_kind", "handoff_priority", "handoff_error_type",
+        }
+    assert lead_turn.diagnostics.handoff_kind == "qualified_lead"
+    assert human_turn.diagnostics.handoff_kind == "escalation"
+    assert failed_turn.diagnostics.handoff_error_type == "HandoffSinkError"
+    # The raw number a customer typed is masked before it reaches the human.
+    escalation_request = sink.list(conversation_id=conversation_id_for(SENDER))[-1].request
+    assert SENDER not in escalation_request.model_dump_json()
+
+
+def test_no_network_activity_with_handoff_sink(knowledge, store, monkeypatch):
+    _guard_network(monkeypatch)
+    sink = InMemoryHandoffSink()
+    orchestrator = make_with_sink(ScriptedLLM([tool_calls(call("call_1")), text("Yes, Yirgacheffe Light is ₹780 and in stock.")]), knowledge, store, sink)
+
+    normal = run(orchestrator, "Do you have Yirgacheffe?")
+    escalated = run(orchestrator, HUMAN_MSG)
+
+    assert normal.reply_text == "Yes, Yirgacheffe Light is ₹780 and in stock."
+    assert escalated.reply_text == HUMAN_HANDOFF_REPLY
+    assert escalated.diagnostics.handoff_outcome == "created"
+    assert len(sink) == 1
+
+
+def test_orchestrator_handoff_code_has_no_external_service_integration():
+    source = inspect.getsource(orchestrator_module)
+    for forbidden in (
+        "slack", "Slack", "crm", "CRM", "smtp", "email", "ticket",
+        "import httpx", "import requests", "import socket", "import urllib", "import aiohttp",
+        "os.environ", "getenv", "get_settings", "Settings",
+    ):
+        assert forbidden not in source, forbidden
+    assert "from app.agent.handoff import" in source
+
+
+# ---------------------------------------------------------------------------
+# 34. Runtime isolation: nothing from this slice is wired into app.main / whatsapp
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_integration_is_not_wired_into_app_main_or_whatsapp():
+    import app.main as main_module
+    import app.whatsapp as whatsapp_package
+
+    main_source = inspect.getsource(main_module)
+    for symbol in ("handoff", "Handoff", "AgentOrchestrator", "app.agent"):
+        assert symbol not in main_source
+    package_dir = os.path.dirname(inspect.getsourcefile(whatsapp_package))
+    for filename in os.listdir(package_dir):
+        if filename.endswith(".py"):
+            with open(os.path.join(package_dir, filename), encoding="utf-8") as handle:
+                assert "handoff" not in handle.read().lower(), filename
+
+
+# ---------------------------------------------------------------------------
+# 38, 39. Bounded behaviour; one submission per escalation event
+# ---------------------------------------------------------------------------
+
+
+def test_sticky_escalation_is_bounded_one_submission_per_turn_one_ticket(knowledge, store):
+    sink = CountingSink()
+    llm = ScriptedLLM([text("never used")])
+    orchestrator = make_with_sink(llm, knowledge, store, sink)
+
+    results = [run(orchestrator, HUMAN_MSG)] + [run(orchestrator, f"message {i}") for i in range(10)]
+
+    assert all(r.reply_text == HUMAN_HANDOFF_REPLY for r in results)
+    assert llm.calls == []
+    assert len(sink.requests) == 11  # one attempt per turn, never more
+    assert len(sink) == 1  # one ticket
+    assert sink.list()[0].submission_count == 11
+    assert [r.diagnostics.handoff_outcome for r in results] == ["created"] + ["deduplicated"] * 10
+    saved = store.get(SENDER)
+    assert saved.turn_count == 11
+    assert len(saved.history) == MAX_CHAT_HISTORY
+    assert len(sink.requests[-1].transcript) <= MAX_CHAT_HISTORY
+
+
+def test_sink_submit_is_called_once_even_when_a_corrective_generation_precedes_handoff_ready(knowledge, store):
+    sink = CountingSink()
+    agent_llm = ScriptedLLM([text(WRONG_PRICE_REPLY), text(SAFE_CORRECTED_REPLY)])
+    extractor_llm = ScriptedLLM([extraction_payload(**WHOLESALE_FIELDS_RAHUL)])
+    orchestrator = make_with_extraction(agent_llm, extractor_llm, knowledge, store, handoff_sink=sink)
+    result = run(orchestrator, "Rahul from Bean House, how much is the Yirgacheffe?")
+
+    assert result.reply_text == SAFE_CORRECTED_REPLY
+    assert result.diagnostics.reply_source == "model_corrected"
+    assert result.diagnostics.grounding_violation_count == 1
+    assert result.diagnostics.escalation_action == "handoff_ready"
+    assert len(sink.requests) == 1
+    assert sink.requests[0].kind == HandoffKind.QUALIFIED_LEAD
+    assert result.diagnostics.handoff_outcome == "created"
+    assert store.get(SENDER).qualification == QualificationState.QUALIFIED
+
+
+def test_handoff_result_structure_round_trips(knowledge, store):
+    sink = InMemoryHandoffSink()
+    result = run(make_with_sink(ScriptedLLM([]), knowledge, store, sink), HUMAN_MSG, message_id="wamid.X")
+    dumped = result.model_dump(mode="json")
+    restored = AgentTurnResult.model_validate(dumped)
+    assert restored.diagnostics.handoff_outcome == "created"
+    assert restored.diagnostics.handoff_id == sink.list()[0].handoff_id
+    assert restored.diagnostics.message_id == "wamid.X"
+    with pytest.raises(Exception):
+        TurnDiagnostics(**{**result.diagnostics.model_dump(), "handoff_outcome": "delivered"})
