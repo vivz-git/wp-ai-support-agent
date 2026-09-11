@@ -4,15 +4,17 @@
 pieces built in earlier Milestone 2 slices:
 
     ConversationStore  -> load / save ``ConversationState``
+    guardrails         -> deterministic detectors + ``GroundingValidator``
+    EscalationPolicy   -> one ``EscalationDecision`` per evaluation
     LeadExtractor      -> validated ``LeadDelta`` from the customer message
     PromptBuilder      -> business-aware messages for the LLM
     LLMProvider        -> ``complete(messages, tools=...)`` (native tool calling)
     ToolRegistry       -> tool specs + deterministic tool execution
 
 Architectural principle: the LLM is NOT the workflow controller. Python owns
-state, validation, tool execution, tool-call limits, error handling,
-persistence and the turn result. The LLM only supplies natural language and
-tool-call requests.
+state, validation, guardrails, escalation, tool execution, tool-call limits,
+error handling, persistence and the turn result. The LLM only supplies
+natural language and tool-call requests.
 
 Design constraints (Milestone 2, Slice 6):
 - Not wired into ``app.main`` or the webhook. The Milestone 1 request path
@@ -28,8 +30,9 @@ Design constraints (Milestone 2, Slice 6):
 
 Lead extraction (Milestone 2, Slice 8):
 - An optional ``LeadExtractor`` runs exactly once per customer turn, after
-  ``begin_turn`` and before the first prompt is built, so the model sees
-  the current lead state. It never runs inside the tool loop.
+  the incoming guardrails allow the turn to continue and before the first
+  prompt is built, so the model sees the current lead state. It never runs
+  inside the tool loop and never runs on a turn the policy short-circuits.
 - The extractor stays pure: its ``LeadDelta`` enters state only through
   ``ConversationState.apply_lead_delta``, which owns merge/provenance and
   recomputes qualification deterministically. The model never sets
@@ -37,7 +40,31 @@ Lead extraction (Milestone 2, Slice 8):
 - Extraction is enrichment, not the response path: a failed, malformed,
   or crashing extraction leaves the lead profile untouched and the turn
   continues normally. It never triggers the safe fallback by itself.
-- No guardrails or escalation policy here; those are later slices.
+
+Guardrails + escalation (Milestone 2, Slice 10):
+- Incoming detectors (``InjectionDetector``, ``AngerScorer``,
+  ``RepetitionDetector``, ``HumanRequestDetector``) run exactly once per
+  customer turn, on the customer text only — never on tool output or
+  model output. They are pure; the orchestrator owns every state change.
+- ``EscalationPolicy`` is evaluated on the incoming signals against the
+  state *before* those signals are applied to ``ConversationFlags`` (the
+  Slice 9 call-order contract: the policy adds this turn's contribution
+  itself). Only afterwards does ``apply_signals_to_flags`` run, once.
+- A blocking incoming decision (``escalate`` / ``refuse`` / ``clarify``)
+  is answered with a deterministic template from this module. No LLM call
+  and no lead extraction happen on such a turn.
+- Every candidate model reply is checked by ``GroundingValidator`` against
+  the current-turn tool results *and* the ``KnowledgeBase`` before it may
+  be sent. A rejected reply is never sent; the policy is re-evaluated with
+  a grounding-only signal bundle (so no incoming counter is double
+  counted), at most ONE tool-free corrective generation is attempted, and
+  if that is also rejected a deterministic recovery reply goes out.
+- ``handoff_ready`` is recorded, not enforced: a qualified, complete lead
+  keeps receiving grounded model replies. The explicit
+  ``mark_handoff_ready`` transition is a consent step owned by a later
+  qualification-policy slice; Python state stays authoritative either way.
+- Fail closed: a detector error skips the LLM for the turn (safe fallback),
+  a policy error escalates, a validator error counts as ungrounded.
 """
 
 import json
@@ -47,9 +74,20 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent.escalation import EscalationAction, EscalationDecision, EscalationPolicy, UserMessageInstruction
 from app.agent.extraction import ExtractionResult, LeadExtractor
+from app.agent.guardrails import (
+    AngerScorer,
+    GroundingResult,
+    GroundingValidator,
+    GuardrailSignals,
+    HumanRequestDetector,
+    InjectionDetector,
+    RepetitionDetector,
+    apply_signals_to_flags,
+)
 from app.agent.prompts import PromptBuilder
-from app.agent.state import ConversationState, MAX_MESSAGE_LENGTH, ToolInvocation
+from app.agent.state import ConversationState, EscalationStatus, MAX_MESSAGE_LENGTH, ToolInvocation
 from app.agent.store import ConversationStore
 from app.config import mask_phone_number
 from app.knowledge import KnowledgeBase
@@ -66,8 +104,55 @@ logger = logging.getLogger(__name__)
 AGENT_MAX_TOOL_ROUNDS = 2
 # After a tool reports ``invalid_input`` the model may correct itself once.
 MAX_INVALID_INPUT_RETRIES = 1
+# After the grounding validator rejects a reply the model may rewrite it once
+# (text-only, no tools). Never more: regeneration is bounded by construction.
+MAX_CORRECTIVE_GENERATIONS = 1
 
 SAFE_FALLBACK_REPLY = "Sorry — I’m having trouble checking that right now. Let me get the team to help."
+
+# Deterministic customer-facing replies the policy can require. The policy
+# modules only emit codes; this is the single place those codes become text.
+# The model never writes a refusal, handoff, or clarification on the
+# policy's behalf.
+SAFE_REFUSAL_REPLY = (
+    "I can help with the coffee, orders, and support questions, "
+    "but I can't provide private system or credential information."
+)
+HUMAN_HANDOFF_REPLY = "I'll get a member of the team to help with this."
+CLARIFICATION_REPLY = "I want to make sure I understand. Could you clarify what you need?"
+UNVERIFIED_RECOVERY_REPLY = "Sorry — I couldn't verify that information reliably. Let me get the team to help."
+
+_INSTRUCTION_REPLIES: Dict[UserMessageInstruction, str] = {
+    UserMessageInstruction.PROVIDE_SAFE_REFUSAL: SAFE_REFUSAL_REPLY,
+    UserMessageInstruction.OFFER_HUMAN_HANDOFF: HUMAN_HANDOFF_REPLY,
+    UserMessageInstruction.ASK_FOR_CLARIFICATION: CLARIFICATION_REPLY,
+    UserMessageInstruction.SUPPRESS_UNGROUNDED_CLAIM: UNVERIFIED_RECOVERY_REPLY,
+}
+
+# Instruction appended (as a system message) for the single corrective
+# generation. Carries grounding reason *codes* only — never customer text.
+CORRECTIVE_INSTRUCTION = (
+    "Your previous draft reply (the assistant message just above) stated product details that are not "
+    "supported by this turn's tool results or the business knowledge in your instructions "
+    "(problems: {codes}). Rewrite the reply using only facts that appear in those sources. Do not state "
+    "any price, availability, origin, or tasting note you cannot see there; if a detail cannot be "
+    "verified, say you will check with the team instead. Do not mention this correction."
+)
+
+# Actions that end the turn with a deterministic reply and no model call.
+_BLOCKING_ACTIONS = frozenset(
+    {EscalationAction.ESCALATE, EscalationAction.REFUSE, EscalationAction.CLARIFY, EscalationAction.SUPPRESS}
+)
+
+# Fail-closed verdict used when the policy itself raises: route to a human.
+_POLICY_ERROR_DECISION = EscalationDecision(
+    action=EscalationAction.ESCALATE,
+    reason_codes=["policy_error"],
+    user_message_instruction=UserMessageInstruction.OFFER_HUMAN_HANDOFF,
+    priority=1,
+)
+
+_ESCALATION_REASON_MAX_LENGTH = 200  # matches EscalationState.reason
 
 # Tool-result statuses shared with ``app.tools`` (see ``ProductLookupStatus``).
 STATUS_OK = "ok"
@@ -93,9 +178,13 @@ LoopExit = Literal[
     "invalid_input_retries_exhausted",
     "empty_reply",
     "llm_error",
+    "not_run",  # the policy or a guardrail failure ended the turn before any model call
 ]
 
-FallbackReason = Literal["empty_reply", "llm_error"]
+FallbackReason = Literal["empty_reply", "llm_error", "guardrail_error", "ungrounded_reply"]
+
+ReplySource = Literal["model", "model_corrected", "policy", "fallback"]
+EscalationStage = Literal["incoming", "outgoing"]
 
 ExtractionSource = Literal["model", "model_repaired", "fallback"]
 _EXTRACTION_SOURCES = ("model", "model_repaired", "fallback")
@@ -125,8 +214,9 @@ class ToolCallRecord(BaseModel):
 class TurnDiagnostics(BaseModel):
     """Safe, structured facts about how a turn ran.
 
-    Never contains prompt text, credentials, authorization headers, or an
-    unmasked phone number.
+    Never contains prompt text, customer text, model output, credentials,
+    authorization headers, or an unmasked phone number. Guardrail fields
+    carry scores, counts and codes only.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -154,6 +244,25 @@ class TurnDiagnostics(BaseModel):
     extracted_field_names: List[str] = Field(default_factory=list)
     extraction_errors_count: int = Field(0, ge=0)
     extraction_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
+    # Incoming guardrails (pattern counts and scores only).
+    injection_suspected: bool = False
+    injection_hit_count: int = Field(0, ge=0)
+    anger_score: float = Field(0.0, ge=0.0, le=1.0)
+    repetition_detected: bool = False
+    human_requested: bool = False
+    guardrail_error_types: List[str] = Field(default_factory=list, description="Exception class names only")
+    # Outgoing grounding.
+    grounding_checks: int = Field(0, ge=0, description="Candidate replies run through the validator")
+    grounding_violation_count: int = Field(0, ge=0, description="Candidate replies the validator rejected")
+    grounding_reason_codes: List[str] = Field(default_factory=list)
+    grounding_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
+    corrective_generation_attempted: bool = False
+    # Escalation policy: the decisive decision for the turn.
+    escalation_action: Optional[str] = None
+    escalation_reason_codes: List[str] = Field(default_factory=list)
+    escalation_stage: Optional[EscalationStage] = None
+    policy_error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
+    reply_source: ReplySource = "model"
 
 
 class AgentTurnResult(BaseModel):
@@ -178,8 +287,9 @@ class _TurnContext:
 
     state: ConversationState
     text: str
-    # Tool-protocol messages appended after the current customer message:
-    # assistant(tool_calls) followed by one role="tool" message per call.
+    # Messages appended after the current customer message: tool-protocol
+    # exchanges (assistant(tool_calls) + one role="tool" per call) and, for
+    # a corrective generation, the rejected draft plus its instruction.
     transcript: List[ChatMessage] = field(default_factory=list)
     records: List[ToolCallRecord] = field(default_factory=list)
     llm_calls: int = 0
@@ -199,6 +309,21 @@ class _TurnContext:
     extracted_field_names: List[str] = field(default_factory=list)
     extraction_errors_count: int = 0
     extraction_error_type: Optional[str] = None
+    # Incoming guardrails (run exactly once per turn).
+    signals: GuardrailSignals = field(default_factory=GuardrailSignals)
+    guardrail_error_types: List[str] = field(default_factory=list)
+    # Outgoing grounding.
+    grounding_checks: int = 0
+    grounding_violation_count: int = 0
+    grounding_reason_codes: List[str] = field(default_factory=list)
+    grounding_error_type: Optional[str] = None
+    corrective_generation_attempted: bool = False
+    # Escalation policy.
+    decision: Optional[EscalationDecision] = None
+    decision_stage: Optional[EscalationStage] = None
+    policy_error_type: Optional[str] = None
+    reply_source: ReplySource = "model"
+    fallback_reason: Optional[FallbackReason] = None
 
     @property
     def invalid_input_budget_exhausted(self) -> bool:
@@ -263,18 +388,38 @@ def _result_error_code(result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _deterministic_reply(decision: EscalationDecision) -> str:
+    """Map a policy instruction to its fixed customer-facing text.
+
+    Unknown instructions fail closed to the handoff text rather than to a
+    model-written reply.
+    """
+    return _INSTRUCTION_REPLIES.get(decision.user_message_instruction, HUMAN_HANDOFF_REPLY)
+
+
+def _escalation_reason(decision: EscalationDecision) -> str:
+    return ",".join(decision.reason_codes)[:_ESCALATION_REASON_MAX_LENGTH] or decision.action.value
+
+
+def _ungrounded_by_error() -> GroundingResult:
+    """The verdict used when the validator itself fails: unverified is unsafe."""
+    return GroundingResult(grounded=False, violations=["validator_error"], reason_codes=["validator_error"])
+
+
 # ---------------------------------------------------------------------------
 # AgentOrchestrator
 # ---------------------------------------------------------------------------
 
 
 class AgentOrchestrator:
-    """Coordinates one conversation turn: state -> prompt -> LLM -> tools -> reply.
+    """Coordinates one conversation turn: state -> guardrails -> prompt -> LLM -> tools -> grounding -> reply.
 
     The orchestrator is a coordinator, not a store: all history lives in
     ``ConversationState`` (persisted through ``ConversationStore``), all
-    prompt text comes from ``PromptBuilder``, and lead data comes only from
-    the optional ``LeadExtractor`` (merged through ``ConversationState``).
+    prompt text comes from ``PromptBuilder``, lead data comes only from the
+    optional ``LeadExtractor`` (merged through ``ConversationState``), and
+    every safety verdict comes from the pure detectors and
+    ``EscalationPolicy``; this class only applies them.
     """
 
     def __init__(
@@ -285,6 +430,12 @@ class AgentOrchestrator:
         store: ConversationStore,
         max_tool_rounds: int = AGENT_MAX_TOOL_ROUNDS,
         extractor: Optional[LeadExtractor] = None,
+        policy: Optional[EscalationPolicy] = None,
+        grounding: Optional[GroundingValidator] = None,
+        injection: Optional[InjectionDetector] = None,
+        anger: Optional[AngerScorer] = None,
+        repetition: Optional[RepetitionDetector] = None,
+        human_request: Optional[HumanRequestDetector] = None,
     ):
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must not be negative")
@@ -295,6 +446,17 @@ class AgentOrchestrator:
         self._max_tool_rounds = max_tool_rounds
         # ``None`` disables lead extraction; the turn then runs exactly as in Slice 6.
         self._extractor = extractor
+        # Guardrails and policy are always on; the arguments exist so tests
+        # can substitute instrumented or failing components.
+        self._policy = policy if policy is not None else EscalationPolicy()
+        # The catalog is the trusted source of truth for product facts, so a
+        # correct claim ("Yirgacheffe Light is ₹780.") grounds against it even
+        # when product_lookup was not called; wrong or unknown claims still fail.
+        self._grounding = grounding if grounding is not None else GroundingValidator(catalog_as_facts=True)
+        self._injection = injection if injection is not None else InjectionDetector()
+        self._anger = anger if anger is not None else AngerScorer()
+        self._repetition = repetition if repetition is not None else RepetitionDetector()
+        self._human_request = human_request if human_request is not None else HumanRequestDetector()
 
     # -- Public API ---------------------------------------------------------
 
@@ -306,8 +468,9 @@ class AgentOrchestrator:
     ) -> AgentTurnResult:
         """Run one customer turn end to end and return a structured result.
 
-        Never raises for LLM or tool failures. Raises ``ValueError`` only
-        for caller misuse (blank ``text``), before any state is touched.
+        Never raises for guardrail, policy, LLM or tool failures. Raises
+        ``ValueError`` only for caller misuse (blank ``text``), before any
+        state is touched.
         """
         customer_text = (text or "").strip()
         if not customer_text:
@@ -321,74 +484,69 @@ class AgentOrchestrator:
 
         # 2. Begin turn: bumps turn_count and resets current-turn tool results.
         # The customer message is appended to history further down, once the
-        # LLM loop is done: PromptBuilder renders the current message itself,
+        # reply is final: PromptBuilder renders the current message itself,
         # delimited, as the final user message, so adding it to ``history``
-        # first would send it twice.
+        # first would send it twice (and the repetition detector compares
+        # against *previous* customer turns only).
         turn = state.begin_turn()
 
         ctx = _TurnContext(state=state, text=customer_text)
         masked_sender = mask_phone_number(sender_id)
 
-        # 3-5. Extract lead data once, merge it, recompute qualification.
-        # Runs before any prompt is built so the model sees the updated lead
-        # state; failure here is non-fatal and never touches the profile.
-        await self._update_lead(ctx, masked_sender, turn)
+        # 3. Incoming guardrails: pure detectors, once, on the customer text only.
+        self._analyze_incoming(ctx, masked_sender, turn)
 
-        # 6-9. Prompt -> LLM -> tools -> reply, with a deterministic fallback.
-        fallback_reason: Optional[FallbackReason] = None
+        # 5. Policy on the incoming signals, evaluated BEFORE the flags absorb
+        #    them (the policy adds this turn's contribution itself).
+        decision = self._evaluate_policy(ctx, ctx.signals, stage="incoming")
+
+        # 4. The orchestrator owns the flag mutation: exactly once for the
+        #    incoming signals. Outgoing grounding bumps its own counter later
+        #    through a grounding-only bundle, so nothing is counted twice.
+        state.flags = apply_signals_to_flags(state.flags, ctx.signals)
+
         error_type: Optional[str] = None
-        try:
-            reply_text, loop_exit = await self._run_turn(ctx)
-            if not reply_text:
-                reply_text = SAFE_FALLBACK_REPLY
-                fallback_reason = "empty_reply"
-                loop_exit = "empty_reply"
-        except Exception as exc:  # provider/tool failures must never escape
-            error_type = type(exc).__name__
-            logger.error(
-                "Agent turn failed for %s (turn %d): %s; returning safe fallback",
-                masked_sender,
-                turn,
-                error_type,
-            )
-            logger.debug("Agent turn failure detail", exc_info=exc)
+        loop_exit: LoopExit = "not_run"
+        if ctx.guardrail_error_types:
+            # Fail closed: an unscreened message never reaches the model.
             reply_text = SAFE_FALLBACK_REPLY
-            fallback_reason = "llm_error"
-            loop_exit = "llm_error"
+            ctx.reply_source = "fallback"
+            ctx.fallback_reason = "guardrail_error"
+        elif decision.action in _BLOCKING_ACTIONS:
+            # Deterministic reply; no extraction, no model, no tools.
+            reply_text = _deterministic_reply(decision)
+            ctx.reply_source = "policy"
+            self._apply_decision(ctx, decision)
+        else:
+            # 6-7. Extract lead data once, merge it, recompute qualification.
+            await self._update_lead(ctx, masked_sender, turn)
 
-        # 10. Persist: this turn's messages, tool history and any other state changes.
+            # 8-12. Prompt -> LLM -> tools -> grounding -> policy -> reply.
+            try:
+                reply_text, loop_exit = await self._generate_reply(ctx)
+            except Exception as exc:  # provider/tool failures must never escape
+                error_type = type(exc).__name__
+                logger.error(
+                    "Agent turn failed for %s (turn %d): %s; returning safe fallback",
+                    masked_sender,
+                    turn,
+                    error_type,
+                )
+                logger.debug("Agent turn failure detail", exc_info=exc)
+                reply_text = SAFE_FALLBACK_REPLY
+                ctx.reply_source = "fallback"
+                ctx.fallback_reason = "llm_error"
+                loop_exit = "llm_error"
+
+        # 13. Persist: this turn's messages, tool history, flags and any other state changes.
         state.add_user_message(customer_text)
         state.add_assistant_message(reply_text)
         self._store.save(state)
 
-        executed = sum(1 for r in ctx.records if r.disposition == "executed")
-        diagnostics = TurnDiagnostics(
-            sender=masked_sender,
-            message_id=message_id,
-            turn=turn,
-            llm_calls=ctx.llm_calls,
-            tool_rounds=ctx.tool_rounds,
-            tool_calls_requested=len(ctx.records),
-            tool_calls_executed=executed,
-            tool_calls_rejected=len(ctx.records) - executed,
-            tool_round_limit_reached=ctx.tool_round_limit_reached,
-            final_call_tools_omitted=ctx.final_call_tools_omitted,
-            loop_exit=loop_exit,
-            fallback_used=fallback_reason is not None,
-            fallback_reason=fallback_reason,
-            error_type=error_type,
-            usage_prompt_tokens=ctx.usage_prompt_tokens,
-            usage_completion_tokens=ctx.usage_completion_tokens,
-            extraction_attempted=ctx.extraction_attempted,
-            extraction_success=ctx.extraction_success,
-            extraction_source=ctx.extraction_source,
-            extracted_field_names=list(ctx.extracted_field_names),
-            extraction_errors_count=ctx.extraction_errors_count,
-            extraction_error_type=ctx.extraction_error_type,
-        )
+        diagnostics = self._diagnostics(ctx, masked_sender, message_id, turn, loop_exit, error_type)
         logger.info(
             "Agent turn complete for %s: turn=%d llm_calls=%d tool_rounds=%d tool_calls=%d exit=%s fallback=%s "
-            "extraction=%s qualification=%s",
+            "extraction=%s qualification=%s escalation=%s/%s grounding_violations=%d reply_source=%s",
             masked_sender,
             turn,
             diagnostics.llm_calls,
@@ -398,15 +556,81 @@ class AgentOrchestrator:
             diagnostics.fallback_used,
             diagnostics.extraction_source or "skipped",
             state.qualification.value,
+            diagnostics.escalation_action,
+            diagnostics.escalation_stage,
+            diagnostics.grounding_violation_count,
+            diagnostics.reply_source,
         )
 
-        # 11. Structured result.
+        # 14. Structured result.
         return AgentTurnResult(
             reply_text=reply_text,
             state_snapshot=state.model_copy(deep=True),
             tool_calls=list(ctx.records),
             diagnostics=diagnostics,
         )
+
+    # -- Incoming guardrails ------------------------------------------------
+
+    def _analyze_incoming(self, ctx: _TurnContext, masked_sender: str, turn: int) -> None:
+        """Run the input-side detectors once on the customer text. Never raises.
+
+        Each detector is contained separately: one that raises simply
+        contributes no signal (``None``) and is recorded by exception type.
+        The caller treats any detector failure as fail-closed for the turn.
+        Detectors receive the text and bounded history only; they cannot
+        mutate ``ConversationState``.
+        """
+        history = list(ctx.state.history)
+        components: Dict[str, Any] = {}
+        detectors = (
+            ("injection", lambda: self._injection.detect(ctx.text)),
+            ("anger", lambda: self._anger.score(ctx.text)),
+            ("repetition", lambda: self._repetition.detect(ctx.text, history)),
+            ("human_request", lambda: self._human_request.detect(ctx.text)),
+        )
+        for name, run in detectors:
+            try:
+                components[name] = run()
+            except Exception as exc:  # detectors are pure; a crash is a bug, not the customer's problem
+                error_type = type(exc).__name__
+                ctx.guardrail_error_types.append(error_type)
+                logger.error("Guardrail detector %s failed for %s (turn %d): %s", name, masked_sender, turn, error_type)
+                logger.debug("Guardrail detector failure detail", exc_info=exc)
+        try:
+            ctx.signals = GuardrailSignals(**components)
+        except Exception as exc:  # a detector returned the wrong shape
+            error_type = type(exc).__name__
+            ctx.guardrail_error_types.append(error_type)
+            ctx.signals = GuardrailSignals()
+            logger.error("Guardrail signals invalid for %s (turn %d): %s", masked_sender, turn, error_type)
+            logger.debug("Guardrail signal failure detail", exc_info=exc)
+
+    # -- Escalation policy --------------------------------------------------
+
+    def _evaluate_policy(
+        self, ctx: _TurnContext, signals: GuardrailSignals, stage: EscalationStage
+    ) -> EscalationDecision:
+        """Ask the pure policy for a verdict. Fails closed (escalate) on error."""
+        try:
+            decision = self._policy.evaluate(signals, ctx.state)
+            if not isinstance(decision, EscalationDecision):
+                raise TypeError("escalation policy returned a non-EscalationDecision")
+        except Exception as exc:  # the policy is pure; failing open is not an option
+            ctx.policy_error_type = type(exc).__name__
+            logger.error("Escalation policy failed (%s): %s; failing closed", stage, ctx.policy_error_type)
+            logger.debug("Escalation policy failure detail", exc_info=exc)
+            decision = _POLICY_ERROR_DECISION
+        ctx.decision = decision
+        ctx.decision_stage = stage
+        return decision
+
+    def _apply_decision(self, ctx: _TurnContext, decision: EscalationDecision) -> None:
+        """Apply the state transition a decision implies. Python only; never the model."""
+        if decision.action == EscalationAction.ESCALATE and ctx.state.escalation.status == EscalationStatus.NONE:
+            ctx.state.mark_escalated(_escalation_reason(decision))
+        # ``handoff_ready`` is reported, not transitioned: ``mark_handoff_ready``
+        # is an explicit consent step owned by a later slice.
 
     # -- Lead extraction ----------------------------------------------------
 
@@ -455,6 +679,93 @@ class AgentOrchestrator:
             )
             logger.debug("Lead extraction failure detail", exc_info=exc)
 
+    # -- Reply generation + outgoing grounding ------------------------------
+
+    async def _generate_reply(self, ctx: _TurnContext) -> "tuple[str, LoopExit]":
+        """LLM/tool loop, then grounding and policy on every candidate reply.
+
+        Returns the final customer-facing text. A candidate the validator
+        rejects is never returned; at most ``MAX_CORRECTIVE_GENERATIONS``
+        tool-free rewrites are tried, then the deterministic recovery reply.
+        """
+        candidate, loop_exit = await self._run_turn(ctx)
+        if not candidate:
+            ctx.reply_source = "fallback"
+            ctx.fallback_reason = "empty_reply"
+            return SAFE_FALLBACK_REPLY, "empty_reply"
+
+        if self._accept_candidate(ctx, candidate):
+            ctx.reply_source = "model"
+            return candidate, loop_exit
+
+        for _ in range(MAX_CORRECTIVE_GENERATIONS):
+            if ctx.grounding_error_type is not None:
+                break  # a broken validator cannot approve a rewrite either
+            ctx.corrective_generation_attempted = True
+            ctx.transcript.append(ChatMessage(role="assistant", content=candidate))
+            ctx.transcript.append(
+                ChatMessage(
+                    role="system",
+                    content=CORRECTIVE_INSTRUCTION.format(codes=", ".join(ctx.grounding_reason_codes) or "unverified"),
+                )
+            )
+            # Text-only, tools never offered: the rewrite may not go looking
+            # for new facts, only drop the unsupported ones.
+            response = await self._call_llm(ctx, tools=None)
+            candidate = response.content or ""
+            if candidate and self._accept_candidate(ctx, candidate):
+                ctx.reply_source = "model_corrected"
+                return candidate, loop_exit
+
+        # Still unsafe (or unverifiable): the deterministic recovery action.
+        ctx.reply_source = "fallback"
+        ctx.fallback_reason = "ungrounded_reply"
+        decision = ctx.decision if ctx.decision is not None else _POLICY_ERROR_DECISION
+        self._apply_decision(ctx, decision)
+        return _deterministic_reply(decision), loop_exit
+
+    def _accept_candidate(self, ctx: _TurnContext, candidate: str) -> bool:
+        """Grounding check + outgoing policy for one candidate reply.
+
+        The policy sees a grounding-only signal bundle plus the current state
+        (qualification, escalation, flags), so the incoming detectors' counts
+        are not applied a second time. Only a rejected candidate bumps
+        ``grounding_violations``.
+        """
+        grounding = self._validate_grounding(ctx, candidate)
+        decision = self._evaluate_policy(ctx, GuardrailSignals(grounding=grounding), stage="outgoing")
+        if decision.action in _BLOCKING_ACTIONS:
+            ctx.grounding_violation_count += 1
+            ctx.state.flags = apply_signals_to_flags(ctx.state.flags, GuardrailSignals(grounding=grounding))
+            return False
+        self._apply_decision(ctx, decision)
+        return True
+
+    def _validate_grounding(self, ctx: _TurnContext, candidate: str) -> GroundingResult:
+        """Check a candidate against current-turn tool results and the knowledge base.
+
+        A validator error is a verdict of *ungrounded*: an unvalidated model
+        reply is never sent.
+        """
+        ctx.grounding_checks += 1
+        try:
+            result = self._grounding.validate(
+                candidate,
+                tool_results=ctx.state.current_turn_tool_results,
+                knowledge=self._knowledge,
+            )
+            if not isinstance(result, GroundingResult):
+                raise TypeError("grounding validator returned a non-GroundingResult")
+        except Exception as exc:
+            ctx.grounding_error_type = type(exc).__name__
+            logger.error("Grounding validation failed: %s; treating reply as ungrounded", ctx.grounding_error_type)
+            logger.debug("Grounding validation failure detail", exc_info=exc)
+            result = _ungrounded_by_error()
+        for code in result.reason_codes:
+            if code not in ctx.grounding_reason_codes:
+                ctx.grounding_reason_codes.append(code)
+        return result
+
     # -- Turn pipeline ------------------------------------------------------
 
     async def _run_turn(self, ctx: _TurnContext) -> "tuple[Optional[str], LoopExit]":
@@ -502,7 +813,7 @@ class AgentOrchestrator:
         return response
 
     def _build_messages(self, ctx: _TurnContext) -> List[ChatMessage]:
-        """Prompt bundle (system, history, current message) + this turn's tool transcript."""
+        """Prompt bundle (system, history, current message) + this turn's transcript."""
         tool_results = [
             invocation.model_dump(mode="json", exclude={"turn"})
             for invocation in ctx.state.current_turn_tool_results
@@ -656,13 +967,74 @@ class AgentOrchestrator:
         if ctx.invalid_input_budget_exhausted and ctx.tools_closed is None:
             ctx.tools_closed = "invalid_input_retries_exhausted"
 
+    # -- Diagnostics --------------------------------------------------------
+
+    @staticmethod
+    def _diagnostics(
+        ctx: _TurnContext,
+        masked_sender: str,
+        message_id: Optional[str],
+        turn: int,
+        loop_exit: LoopExit,
+        error_type: Optional[str],
+    ) -> TurnDiagnostics:
+        executed = sum(1 for r in ctx.records if r.disposition == "executed")
+        signals = ctx.signals
+        decision = ctx.decision
+        return TurnDiagnostics(
+            sender=masked_sender,
+            message_id=message_id,
+            turn=turn,
+            llm_calls=ctx.llm_calls,
+            tool_rounds=ctx.tool_rounds,
+            tool_calls_requested=len(ctx.records),
+            tool_calls_executed=executed,
+            tool_calls_rejected=len(ctx.records) - executed,
+            tool_round_limit_reached=ctx.tool_round_limit_reached,
+            final_call_tools_omitted=ctx.final_call_tools_omitted,
+            loop_exit=loop_exit,
+            fallback_used=ctx.fallback_reason is not None,
+            fallback_reason=ctx.fallback_reason,
+            error_type=error_type,
+            usage_prompt_tokens=ctx.usage_prompt_tokens,
+            usage_completion_tokens=ctx.usage_completion_tokens,
+            extraction_attempted=ctx.extraction_attempted,
+            extraction_success=ctx.extraction_success,
+            extraction_source=ctx.extraction_source,
+            extracted_field_names=list(ctx.extracted_field_names),
+            extraction_errors_count=ctx.extraction_errors_count,
+            extraction_error_type=ctx.extraction_error_type,
+            injection_suspected=bool(signals.injection is not None and signals.injection.suspected),
+            injection_hit_count=signals.injection.hit_count if signals.injection is not None else 0,
+            anger_score=signals.anger.score if signals.anger is not None else 0.0,
+            repetition_detected=bool(signals.repetition is not None and signals.repetition.repeated),
+            human_requested=bool(signals.human_request is not None and signals.human_request.requested),
+            guardrail_error_types=list(ctx.guardrail_error_types),
+            grounding_checks=ctx.grounding_checks,
+            grounding_violation_count=ctx.grounding_violation_count,
+            grounding_reason_codes=list(ctx.grounding_reason_codes),
+            grounding_error_type=ctx.grounding_error_type,
+            corrective_generation_attempted=ctx.corrective_generation_attempted,
+            escalation_action=decision.action.value if decision is not None else None,
+            escalation_reason_codes=list(decision.reason_codes) if decision is not None else [],
+            escalation_stage=ctx.decision_stage,
+            policy_error_type=ctx.policy_error_type,
+            reply_source=ctx.reply_source,
+        )
+
 
 __all__ = [
     "AGENT_MAX_TOOL_ROUNDS",
     "AgentOrchestrator",
     "AgentTurnResult",
+    "CLARIFICATION_REPLY",
+    "CORRECTIVE_INSTRUCTION",
+    "HUMAN_HANDOFF_REPLY",
+    "MAX_CORRECTIVE_GENERATIONS",
     "MAX_INVALID_INPUT_RETRIES",
     "SAFE_FALLBACK_REPLY",
+    "SAFE_REFUSAL_REPLY",
     "ToolCallRecord",
     "TurnDiagnostics",
+    "UNVERIFIED_RECOVERY_REPLY",
 ]
