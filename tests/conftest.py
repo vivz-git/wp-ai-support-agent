@@ -1,6 +1,6 @@
 import os
 import pytest
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi.testclient import TestClient
 
 # Configure test environment variables before application settings load
@@ -12,9 +12,19 @@ os.environ["GROQ_API_KEY"] = "mock_groq_api_key_67890"
 os.environ["GROQ_MODEL"] = "llama-3.3-70b-versatile"
 os.environ["MAX_MEMORY_MESSAGES"] = "10"
 
+from app.agent.handoff import InMemoryHandoffSink
+from app.agent.store import ConversationStore
 from app.config import Settings, get_settings
-from app.llm.base import ChatMessage, LLMProvider, LLMProviderError
-from app.main import app, get_llm_provider, get_memory, get_settings as main_get_settings, get_whatsapp_client
+from app.llm.base import ChatMessage, LLMProvider, LLMProviderError, LLMResponse
+from app.main import (
+    app,
+    get_conversation_store,
+    get_handoff_sink,
+    get_llm_provider,
+    get_memory,
+    get_settings as main_get_settings,
+    get_whatsapp_client,
+)
 from app.memory import InMemoryConversationMemory
 from app.whatsapp.client import WhatsAppClient, WhatsAppClientError
 
@@ -36,6 +46,17 @@ class MockLLMProvider:
         if self.raise_error:
             raise LLMProviderError("Simulated Groq API failure")
         return self.response_text
+
+    async def complete(
+        self,
+        messages: List[ChatMessage],
+        tools: Optional[List[Any]] = None,
+        tool_choice: Optional[Any] = None,
+    ) -> LLMResponse:
+        self.calls.append(messages)
+        if self.raise_error:
+            raise LLMProviderError("Simulated Groq API failure")
+        return LLMResponse(content=self.response_text, finish_reason="stop")
 
 
 class MockWhatsAppClient:
@@ -87,12 +108,24 @@ def test_memory() -> InMemoryConversationMemory:
 
 
 @pytest.fixture
-def client(mock_settings, mock_llm, mock_wa, test_memory) -> TestClient:
+def test_store() -> ConversationStore:
+    return ConversationStore()
+
+
+@pytest.fixture
+def test_sink() -> InMemoryHandoffSink:
+    return InMemoryHandoffSink()
+
+
+@pytest.fixture
+def client(mock_settings, mock_llm, mock_wa, test_memory, test_store, test_sink) -> TestClient:
     """Provide a TestClient with dependency overrides for isolated testing."""
     app.dependency_overrides[main_get_settings] = lambda: mock_settings
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
     app.dependency_overrides[get_whatsapp_client] = lambda: mock_wa
     app.dependency_overrides[get_memory] = lambda: test_memory
+    app.dependency_overrides[get_conversation_store] = lambda: test_store
+    app.dependency_overrides[get_handoff_sink] = lambda: test_sink
 
     with TestClient(app) as test_client:
         yield test_client

@@ -66,11 +66,9 @@ def test_valid_incoming_text_payload(client: TestClient, valid_text_payload, moc
     assert sent["body"] == mock_llm.response_text
 
     # Verify LLM was called with the user's message
-    assert len(mock_llm.calls) == 1
-    history = mock_llm.calls[0]
-    assert len(history) == 1
-    assert history[0].role == "user"
-    assert history[0].content == "Hello, I want to inquire about pricing."
+    assert len(mock_llm.calls) >= 1
+    all_contents = [msg.content for call in mock_llm.calls for msg in call]
+    assert any("Hello, I want to inquire about pricing." in content for content in all_contents)
 
 
 def test_malformed_payload_missing_keys(client: TestClient):
@@ -151,7 +149,7 @@ def test_meta_sample_test_event_send_failure_handled_safely(
     assert "message_id" in data
 
     # The LLM was still invoked (proves parse -> memory -> Groq worked)
-    assert len(mock_llm.calls) == 1
+    assert len(mock_llm.calls) >= 1
     # No message was actually recorded as successfully sent
     assert len(failing_wa_client.sent_messages) == 0
 
@@ -165,6 +163,11 @@ def test_duplicate_webhook_delivery_does_not_send_twice(
     assert first_response.status_code == 200
     assert first_response.json()["status"] == "ok"
 
+    initial_llm_calls = len(mock_llm.calls)
+    initial_wa_sends = len(mock_wa.sent_messages)
+    assert initial_wa_sends == 1
+    assert initial_llm_calls >= 1
+
     # Meta redelivers the identical event (e.g. because the first response was slow
     # or a prior non-200 was returned)
     second_response = client.post("/webhook/whatsapp", json=valid_text_payload)
@@ -172,16 +175,17 @@ def test_duplicate_webhook_delivery_does_not_send_twice(
     assert second_response.json()["status"] == "duplicate_ignored"
 
     # LLM and WhatsApp send should each have been invoked exactly once, not twice
-    assert len(mock_llm.calls) == 1
-    assert len(mock_wa.sent_messages) == 1
+    assert len(mock_llm.calls) == initial_llm_calls
+    assert len(mock_wa.sent_messages) == initial_wa_sends
 
 
-def test_llm_failure_returns_200_without_sending(
+def test_llm_failure_returns_200_with_safe_fallback(
     client: TestClient, valid_text_payload, mock_wa
 ):
-    """If the LLM provider fails, the webhook should still acknowledge with 200
-    (so Meta doesn't retry and re-run the LLM again) and must not attempt to send
-    a WhatsApp reply."""
+    """If the LLM provider fails, the orchestrator produces a deterministic safe
+    fallback reply, the webhook acknowledges with 200 (so Meta doesn't retry
+    and re-run), and the customer receives the safe fallback message."""
+    from app.agent.orchestrator import SAFE_FALLBACK_REPLY
     from app.main import app, get_llm_provider
 
     failing_llm = MockLLMProvider(raise_error=True)
@@ -191,6 +195,27 @@ def test_llm_failure_returns_200_without_sending(
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "llm_error"
+    assert data["status"] == "ok"
+    assert "message_id" in data
 
+    assert len(mock_wa.sent_messages) == 1
+    assert mock_wa.sent_messages[0]["body"] == SAFE_FALLBACK_REPLY
+
+
+def test_orchestrator_unexpected_failure_returns_200_agent_error(
+    client: TestClient, valid_text_payload, mock_wa
+):
+    """If AgentOrchestrator.handle_turn raises unexpectedly, the webhook catches it,
+    logs safely, does not call WhatsApp send, and acknowledges with 200 agent_error."""
+    from unittest.mock import AsyncMock
+    from app.main import app, get_orchestrator
+
+    failing_orch = AsyncMock()
+    failing_orch.handle_turn.side_effect = RuntimeError("Simulated internal crash")
+    app.dependency_overrides[get_orchestrator] = lambda: failing_orch
+
+    response = client.post("/webhook/whatsapp", json=valid_text_payload)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "agent_error"
     assert len(mock_wa.sent_messages) == 0
