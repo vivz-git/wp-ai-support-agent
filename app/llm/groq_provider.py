@@ -69,7 +69,19 @@ class GroqProvider:
         return self._client
 
     def _format_messages(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
-        formatted: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        """Convert ``messages`` to the Groq/OpenAI wire format.
+
+        Prompt ownership: if the caller already supplied a system message
+        (e.g. ``PromptBuilder`` or ``LeadExtractor``), it is preserved as-is
+        and the configured ``self.system_prompt`` is NOT injected — a
+        second, provider-owned system message would otherwise reach Groq
+        alongside the caller's. ``self.system_prompt`` is only prepended as
+        a backwards-compatible default for callers (e.g. legacy
+        ``get_agent_reply`` usage) that pass no system message at all.
+        """
+        formatted: List[Dict[str, Any]] = []
+        if not any(msg.role == "system" for msg in messages):
+            formatted.append({"role": "system", "content": self.system_prompt})
         for msg in messages:
             entry: Dict[str, Any] = {"role": msg.role, "content": msg.content}
             # Tool-transcript fields are forwarded only when present so plain
