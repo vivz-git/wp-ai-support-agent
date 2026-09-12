@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — Kettle &amp; Bloom WhatsApp Support Demo</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f7f5f2;
+    --surface: #ffffff;
+    --text: #23201c;
+    --muted: #5b564f;
+    --border: #e3ddd3;
+    --accent: #6b4226;
+    --notice-bg: #fbf2e4;
+    --notice-border: #e7c98c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Georgia, "Times New Roman", serif;
+    line-height: 1.6;
+  }
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 3rem;
+  }
+  header.page-header {
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1.25rem;
+  }
+  header.page-header .brand {
+    font-size: 0.95rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-family: Arial, Helvetica, sans-serif;
+    margin: 0 0 0.5rem;
+  }
+  h1 {
+    font-size: 1.9rem;
+    margin: 0 0 0.4rem;
+  }
+  .effective-date {
+    color: var(--muted);
+    font-size: 0.95rem;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  .notice {
+    background: var(--notice-bg);
+    border: 1px solid var(--notice-border);
+    border-radius: 6px;
+    padding: 1rem 1.15rem;
+    margin: 1.5rem 0 2rem;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 0.95rem;
+  }
+  .notice strong { color: var(--accent); }
+  section {
+    margin-bottom: 1.9rem;
+  }
+  h2 {
+    font-size: 1.2rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.35rem;
+    margin-bottom: 0.75rem;
+  }
+  h3 {
+    font-size: 1.02rem;
+    margin-bottom: 0.4rem;
+  }
+  p, li { color: var(--text); }
+  ul { padding-left: 1.3rem; }
+  li { margin-bottom: 0.35rem; }
+  .surface {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem 1.75rem;
+  }
+  code {
+    font-family: "Courier New", monospace;
+    background: #efeae2;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    font-size: 0.9em;
+  }
+  a { color: var(--accent); }
+  footer.page-footer {
+    margin-top: 2.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  @media (max-width: 480px) {
+    .surface { padding: 1.25rem 1.1rem; }
+    h1 { font-size: 1.6rem; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page-header">
+    <p class="brand">Kettle &amp; Bloom — WhatsApp AI Support Agent (Portfolio Demo)</p>
+    <h1>Privacy Policy</h1>
+    <p class="effective-date">Effective date: September 12, 2026</p>
+  </header>
+
+  <div class="notice">
+    <strong>Demo / portfolio disclosure:</strong> This Privacy Policy describes a
+    non-commercial software portfolio project. "Kettle &amp; Bloom Coffee
+    Roasters" is a <strong>fictional business</strong> created solely to
+    demonstrate an AI-driven WhatsApp customer support agent. It is not a
+    real company, does not sell real products, and does not process real
+    orders or payments. Any resemblance to an actual business is
+    coincidental.
+  </div>
+
+  <div class="surface">
+
+    <section id="who-operates">
+      <h2>1. Who Operates This Demo</h2>
+      <p>
+        This application ("the demo," "the assistant," "the agent") is a
+        personal software portfolio project built to demonstrate an
+        AI-assisted WhatsApp support workflow using the Meta WhatsApp Cloud
+        API, a FastAPI backend, and the Groq LLM API. It is operated by an
+        individual developer for demonstration and evaluation purposes, not
+        by a registered company.
+      </p>
+    </section>
+
+    <section id="what-we-receive">
+      <h2>2. Information the Assistant Receives</h2>
+      <p>
+        When someone sends a WhatsApp message to the demo's connected test
+        number, Meta's WhatsApp Cloud API delivers a webhook event to the
+        backend. Depending on what the sender writes, the application may
+        receive:
+      </p>
+      <ul>
+        <li><strong>WhatsApp sender identifier</strong> — the sender's WhatsApp
+          phone number and Meta's message ID (WAMID) for the event.</li>
+        <li><strong>Message text</strong> — the plain-text content of the message
+          the sender writes to the assistant.</li>
+        <li><strong>Information the sender chooses to share in conversation</strong>
+          — for example a name, city, business name/type, preferred coffee
+          brew method, budget range, or estimated monthly volume, if and
+          when the sender volunteers it while asking about products,
+          orders, or wholesale supply.</li>
+      </ul>
+      <p>
+        The assistant only processes messages Meta forwards from the
+        connected WhatsApp number. It does not scrape, purchase, or receive
+        contact data from any other source.
+      </p>
+    </section>
+
+    <section id="conversation-state">
+      <h2>3. Conversation History and Lead Information</h2>
+      <p>
+        To hold a coherent conversation, the backend keeps a short-lived,
+        per-sender <em>conversation state</em> in the server's memory. This
+        can include:
+      </p>
+      <ul>
+        <li>A bounded window of recent message history for that sender
+          (used so the assistant can refer back to what was just said).</li>
+        <li>A "lead profile" of information the sender has volunteered —
+          such as name, city, email, business name/type, brew or product
+          preference, budget band, timeline, or estimated volume — used only
+          to route the conversation (for example, to a human for a
+          wholesale quote).</li>
+        <li>Basic conversation bookkeeping, such as turn counters,
+          escalation status, and a record of which support tool (e.g.
+          product lookup) was used, without payment or card data.</li>
+      </ul>
+      <p>
+        This state is held only in the running application's memory. It is
+        not written to a database or disk, and is not persisted across a
+        restart of the demo server.
+      </p>
+    </section>
+
+    <section id="human-handoff">
+      <h2>4. Human Handoff Information</h2>
+      <p>
+        Some conversations (for example, a request to speak with a person,
+        a wholesale inquiry, or a flagged issue) are routed to a "human
+        handoff" queue for follow-up. A handoff record deliberately carries
+        only what a human would need to help: a masked/partial version of
+        the sender's number, the lead information described above, a short
+        conversation summary, a bounded transcript excerpt, and the reason
+        the conversation was escalated. In this demo the handoff queue is
+        an in-memory, in-process list — it is not sent to any external CRM,
+        ticketing system, or third party, and it is cleared when the demo
+        server restarts.
+      </p>
+    </section>
+
+    <section id="why-we-use-it">
+      <h2>5. Why This Information Is Used</h2>
+      <ul>
+        <li>To understand and respond to the message currently being sent.</li>
+        <li>To keep track of the conversation across a few back-and-forth
+          messages.</li>
+        <li>To answer product and support questions using the demo's fixed
+          product catalog and business FAQ information.</li>
+        <li>To recognize when a conversation should be handed to a human
+          instead of continuing with the automated assistant.</li>
+        <li>To demonstrate lead-qualification behavior (e.g. distinguishing a
+          casual question from a wholesale inquiry) as part of the
+          portfolio project.</li>
+      </ul>
+      <p>
+        Information is not used for advertising, profiling, resale, or any
+        purpose unrelated to generating and routing a reply within this
+        demo.
+      </p>
+    </section>
+
+    <section id="ai-processing">
+      <h2>6. AI-Assisted Processing</h2>
+      <p>
+        Replies are generated with the help of a large language model
+        accessed through the Groq API. To generate a response, the relevant
+        parts of the current conversation (the message text, a short recent
+        history window, and static business/product information) are sent
+        to Groq's API for processing. Deterministic checks in the
+        application — not the model itself — decide when to escalate to a
+        human, what counts as a supported product claim, and what the
+        assistant is and is not allowed to say.
+      </p>
+    </section>
+
+    <section id="external-providers">
+      <h2>7. External Services Involved</h2>
+      <p>
+        Operating this demo necessarily involves two external providers:
+      </p>
+      <ul>
+        <li><strong>Meta (WhatsApp Cloud API)</strong> — delivers incoming
+          WhatsApp messages to the backend and delivers the assistant's
+          replies back to WhatsApp. Meta's own privacy policy governs its
+          handling of WhatsApp messages as the messaging platform.</li>
+        <li><strong>Groq (LLM API)</strong> — receives conversation text (as
+          described in Section 6) in order to generate the assistant's
+          natural-language reply.</li>
+      </ul>
+      <p>
+        No other third party, analytics vendor, advertising network,
+        payment processor, or data broker receives information from this
+        demo.
+      </p>
+    </section>
+
+    <section id="retention">
+      <h2>8. Retention and Storage</h2>
+      <p>
+        This demo is built to keep all conversation and lead state
+        in-memory, inside the running server process, with fixed upper
+        bounds on how much history, lead data, and handoff records it
+        keeps per sender. There is no external database, data warehouse, or
+        persistent disk storage in this application. Restarting the demo
+        server clears all conversation state, lead data, and handoff
+        records it was holding. Message content passed to Meta and Groq is
+        subject to those providers' own retention practices, which this
+        project does not control.
+      </p>
+    </section>
+
+    <section id="security">
+      <h2>9. Security Practices Actually Implemented</h2>
+      <p>
+        The codebase for this demo takes the following concrete steps:
+      </p>
+      <ul>
+        <li>API credentials (WhatsApp access token, Groq API key, webhook
+          verify token) are read from local environment configuration and
+          are never written to logs.</li>
+        <li>Phone numbers are masked before being written to logs (e.g.
+          shown as <code>********1234</code>), so raw numbers do not appear
+          in application logs.</li>
+        <li>Exceptions from external providers are logged by error type
+          only, not with raw provider error text, so provider responses
+          are not incidentally logged in full.</li>
+        <li>Conversation and lead data are validated against a fixed schema
+          before being stored in memory.</li>
+      </ul>
+      <p>
+        This is a portfolio-scale demo, not an audited production system.
+        No formal certification (for example, a claim of "GDPR compliance,"
+        "SOC 2," or "HIPAA compliance") is made, because none has been
+        obtained or verified for this project.
+      </p>
+    </section>
+
+    <section id="payments">
+      <h2>10. No Payment or Card Data</h2>
+      <p>
+        The WhatsApp assistant does not process orders, take payments, or
+        collect card, bank, or other financial account details at any
+        point. The fictional business data behind this demo explicitly
+        describes payment as being handled elsewhere (a separate website
+        checkout in the fictional scenario), never via WhatsApp. This
+        demo does not sell anything and has no real checkout flow.
+      </p>
+    </section>
+
+    <section id="no-sale">
+      <h2>11. No Sale of Personal Information</h2>
+      <p>
+        Information received through this demo is never sold, rented, or
+        traded to any third party. It is used only to operate the demo
+        conversation flow described above.
+      </p>
+    </section>
+
+    <section id="minimization">
+      <h2>12. No Unnecessary Collection</h2>
+      <p>
+        The assistant does not ask for information it does not need to
+        answer a support question or route a lead. It does not request
+        government ID numbers, financial account details, precise location,
+        or any sensitive personal data category, and it is explicitly
+        instructed not to collect payment or card details.
+      </p>
+    </section>
+
+    <section id="your-choices">
+      <h2>13. Deletion and Contact Requests</h2>
+      <p>
+        Because this is a demo with in-memory-only storage, restarting the
+        server already clears held conversation and lead state. If you
+        interacted with a live instance of this demo and want to confirm
+        that no record was retained, or you have any other question about
+        this policy, you can reach out using the contact details below.
+      </p>
+    </section>
+
+    <section id="changes">
+      <h2>14. Changes to This Policy</h2>
+      <p>
+        This policy may be updated as the demo project changes. The
+        "Effective date" at the top of this page reflects the most recent
+        revision. Since this is a portfolio project rather than a live
+        commercial service, changes are made on an as-needed basis rather
+        than on a fixed schedule.
+      </p>
+    </section>
+
+    <section id="contact">
+      <h2>15. Contact</h2>
+      <p>
+        For questions about this Privacy Policy or this demo project,
+        contact:
+        <br>
+        <strong>Email:</strong>
+        <code>hello@kettleandbloom.example.invalid</code>
+        <br>
+        <span style="font-size:0.9em; color:var(--muted);">
+          Note: this address uses the reserved <code>.invalid</code> domain
+          from the project's fictional business data and is a placeholder
+          for demo purposes, not a real monitored inbox.
+        </span>
+      </p>
+    </section>
+
+  </div>
+
+  <footer class="page-footer">
+    <p>
+      Kettle &amp; Bloom Coffee Roasters is a fictional business created for
+      the WP_AI_Support_Agent portfolio project. This page describes a
+      demo application, not a real commercial service.
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>
