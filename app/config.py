@@ -68,7 +68,7 @@ class Settings(BaseSettings):
         description="API key for Groq Cloud",
     )
     groq_model: str = Field(
-        default="llama-3.3-70b-versatile",
+        default="openai/gpt-oss-120b",
         alias="GROQ_MODEL",
         description="Groq model ID to use for conversation replies",
     )

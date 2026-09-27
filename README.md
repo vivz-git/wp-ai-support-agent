@@ -118,7 +118,7 @@ cp .env.example .env
 | Variable Name | Default | Description |
 | :--- | :--- | :--- |
 | `WHATSAPP_API_VERSION` | `v22.0` | Meta Graph API version. |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model identifier used for replies. |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model identifier used for replies (Groq periodically retires older models; check console.groq.com/docs/models if replies start failing). |
 | `SYSTEM_PROMPT` | *(Included in config)* | System instructions guiding the assistant's behavior. |
 | `MAX_MEMORY_MESSAGES` | `10` | Maximum recent turns retained per sender in memory. |
 | `DRAFTS_DB_PATH` | `drafts.db` | SQLite file for reply drafts awaiting staff approval (`/staff`). |

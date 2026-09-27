@@ -48,7 +48,7 @@ class GroqProvider:
     def __init__(
         self,
         api_key: str,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "openai/gpt-oss-120b",
         system_prompt: str = (
             "You are a professional, helpful, and polite customer support AI agent for WhatsApp. "
             "Keep your answers concise, clear, and direct, suitable for WhatsApp messaging."
