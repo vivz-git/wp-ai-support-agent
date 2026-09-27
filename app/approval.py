@@ -145,6 +145,24 @@ class DraftQueue:
             ).fetchall()
         return [_to_draft(row) for row in rows]
 
+    def list_by_sender(self, sender: str) -> List[Draft]:
+        """Every draft for one sender, oldest first (chat order)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_COLUMNS} FROM drafts WHERE sender = ? ORDER BY id ASC",
+                (sender,),
+            ).fetchall()
+        return [_to_draft(row) for row in rows]
+
+    def list_senders(self, prefix: str = "") -> List[str]:
+        """Distinct senders with at least one draft, most-recently-active first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sender, MAX(id) AS last_id FROM drafts WHERE sender LIKE ? GROUP BY sender ORDER BY last_id DESC",
+                (f"{prefix}%",),
+            ).fetchall()
+        return [row["sender"] for row in rows]
+
     def list_recent(self, limit: int = 20) -> List[Draft]:
         """Recently handled (sent or rejected) drafts, newest first."""
         with self._lock:

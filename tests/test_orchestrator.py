@@ -857,13 +857,20 @@ def test_plain_chat_message_has_no_tool_fields_by_default():
 
 
 def test_orchestrator_wiring_and_boundary_isolation():
+    import app.dependencies as dependencies_module
     import app.main as main_module
     import app.agent.orchestrator as orchestrator_module
 
     main_source = inspect.getsource(main_module)
     assert "orchestrator" in main_source
     assert "AgentOrchestrator" in main_source
-    assert "ConversationStore" in main_source
+
+    # The actual DI wiring (constructing the real collaborators) lives in
+    # app.dependencies, shared by the webhook, /staff and /simulate; app.main
+    # only imports and uses the provider functions.
+    dependencies_source = inspect.getsource(dependencies_module)
+    assert "AgentOrchestrator" in dependencies_source
+    assert "ConversationStore" in dependencies_source
 
     orchestrator_source = inspect.getsource(orchestrator_module)
     import_pattern = re.compile(r"^\s*(from|import)\s+app\.(main|whatsapp) ", re.MULTILINE)
@@ -1530,11 +1537,14 @@ def test_no_network_activity_with_extraction_enabled(knowledge, store, monkeypat
 
 
 def test_extraction_integration_is_wired_into_app_main():
+    import app.dependencies as dependencies_module
     import app.main as main_module
 
     main_source = inspect.getsource(main_module)
-    assert "LeadExtractor" in main_source
     assert "get_lead_extractor" in main_source
+    dependencies_source = inspect.getsource(dependencies_module)
+    assert "LeadExtractor" in dependencies_source
+    assert "get_lead_extractor" in dependencies_source
 
 
 # ===========================================================================
@@ -3464,12 +3474,15 @@ def test_orchestrator_handoff_code_has_no_external_service_integration():
 
 
 def test_handoff_integration_is_wired_into_app_main_and_isolates_whatsapp():
+    import app.dependencies as dependencies_module
     import app.main as main_module
     import app.whatsapp as whatsapp_package
 
     main_source = inspect.getsource(main_module)
-    assert "InMemoryHandoffSink" in main_source
     assert "get_handoff_sink" in main_source
+    dependencies_source = inspect.getsource(dependencies_module)
+    assert "InMemoryHandoffSink" in dependencies_source
+    assert "get_handoff_sink" in dependencies_source
     package_dir = os.path.dirname(inspect.getsourcefile(whatsapp_package))
     for filename in os.listdir(package_dir):
         if filename.endswith(".py"):
@@ -3928,19 +3941,27 @@ def test_slice14_wamid_duplicate_check_belongs_to_the_adapter_in_front_of_handle
 
 
 def test_slice15_webhook_keeps_the_ledger_in_front_of_the_orchestrator():
-    """Regression pin: ``app.main`` still checks the WAMID ledger before any
-    orchestrator call, and none of that logic has moved into the agent package."""
+    """Regression pin: the shared turn pipeline (used by both the real webhook
+    and /simulate) still checks the WAMID ledger before any orchestrator call,
+    ``app.main`` delegates to it rather than reimplementing it inline, and
+    none of that logic has moved into the agent package."""
     import app.main as main_module
+    import app.turn_pipeline as pipeline_module
+
+    pipeline_source = inspect.getsource(pipeline_module)
+    duplicate_check = pipeline_source.index("memory.has_processed(message_id)")
+    mark = pipeline_source.index("memory.mark_processed(message_id)")
+    orchestrator_call = pipeline_source.index("orchestrator.handle_turn(")
+    queue = pipeline_source.index("drafts.add(")
+    assert duplicate_check < mark < orchestrator_call < queue
+    assert "duplicate_ignored" in pipeline_source
+    # Neither module ever sends: delivery happens only from the staff approval page.
+    assert "send_text(" not in pipeline_source
 
     main_source = inspect.getsource(main_module)
-    duplicate_check = main_source.index("memory.has_processed(msg.message_id)")
-    mark = main_source.index("memory.mark_processed(msg.message_id)")
-    orchestrator_call = main_source.index("orchestrator.handle_turn(")
-    queue = main_source.index("drafts.add(")
-    assert duplicate_check < mark < orchestrator_call < queue
-    # The webhook never sends: delivery happens only from the staff approval page.
+    assert "process_incoming_message(" in main_source
     assert "send_text(" not in main_source
-    assert "duplicate_ignored" in main_source
+
     agent_dir = os.path.dirname(inspect.getsourcefile(orchestrator_module))
     for filename in os.listdir(agent_dir):
         if filename.endswith(".py"):
@@ -4180,6 +4201,7 @@ def test_slice14_no_network_across_policy_refusal_escalation_and_failure_paths(k
 
 
 def test_slice15_boundary_hardening_verifies_pure_agent_and_whatsapp_isolation():
+    import app.dependencies as dependencies_module
     import app.main as main_module
     import app.whatsapp as whatsapp_package
     from app.agent import escalation as escalation_module
@@ -4194,7 +4216,8 @@ def test_slice15_boundary_hardening_verifies_pure_agent_and_whatsapp_isolation()
             assert forbidden not in source, (module.__name__, forbidden)
     main_source = inspect.getsource(main_module)
     assert "AgentOrchestrator" in main_source
-    assert "InMemoryHandoffSink" in main_source
+    dependencies_source = inspect.getsource(dependencies_module)
+    assert "InMemoryHandoffSink" in dependencies_source
     package_dir = os.path.dirname(inspect.getsourcefile(whatsapp_package))
     for filename in os.listdir(package_dir):
         if filename.endswith(".py"):

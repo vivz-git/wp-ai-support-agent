@@ -9,8 +9,12 @@ This project contains **Portfolio Demo #2**, an AI-driven WhatsApp support agent
 The agent now runs as the WhatsApp front desk of **SmileCare Dental**, a fictional clinic in Pune. It reuses the existing pipeline rather than adding parallel systems:
 
 ```
-WhatsApp -> webhook -> AgentOrchestrator (guardrails -> policy -> extraction -> LLM + clinic_faq_lookup -> grounding)
-         -> SQLite draft queue -> /staff (human approves / edits / rejects) -> WhatsApp Cloud API
+WhatsApp -----\
+                >- process_incoming_message() -> AgentOrchestrator (guardrails -> policy ->
+/simulate ----/    extraction -> LLM + clinic_faq_lookup -> grounding)
+         -> SQLite draft queue -> /staff (human approves / edits / rejects)
+                                     -> WhatsApp Cloud API (real sender)
+                                     -> shown in /simulate (SIM- sender, no API call)
 ```
 
 ### What changed
@@ -25,6 +29,7 @@ WhatsApp -> webhook -> AgentOrchestrator (guardrails -> policy -> extraction -> 
 | Grounding | `GroundingValidator` checks every rupee amount against the service ranges, rejects unknown "Dr. …" names, and treats any medicine name or dose as unverified medical advice. |
 | Human approval | The webhook no longer sends replies. Every reply is written to the `drafts` table in SQLite (`sender`, `patient_message`, `draft_text`, `status`, `is_urgent`, `timestamp`). Escalated turns (emergency, angry complaint, human request) are stored with `is_urgent=1`. |
 | Staff page | `app/staff.py` serves `/staff`: pending drafts with urgent ones highlighted at the top, each with **Approve & send**, **Save edit** and **Reject**. Approve sends the (possibly edited) text through the existing `WhatsAppClient.send_text` and marks the draft `sent`. Approvals are claimed atomically, so a double click cannot send twice; a failed send puts the draft back in the queue. |
+| Patient simulator | `app/simulate.py` serves `/simulate`: a WhatsApp-lookalike chat for demos with no real WhatsApp number needed — see below. |
 
 ### Running the webhook and `/staff`
 
@@ -55,6 +60,31 @@ curl -X POST http://localhost:8000/webhook/whatsapp -H "Content-Type: applicatio
 
 The response is `{"status":"pending_approval", ..., "is_urgent":true}`. Refresh `/staff` to see the urgent draft at the top. Approving it calls the real WhatsApp API, which only delivers to numbers on your test allow-list.
 
+### Demo mode: `/simulate` (no WhatsApp, no allow-list)
+
+The recipient-allow-list limit above is exactly why `/simulate` exists: a WhatsApp-lookalike chat page for running a full demo — including approving replies — without a real phone number or Meta test recipient.
+
+```
+http://localhost:8000/simulate
+```
+
+How it works:
+
+- Every simulated patient's id starts with `SIM-`. Type any label (e.g. `priya`) and it's normalized to `SIM-PRIYA`; typing it again (any case, with or without the prefix) reopens the same conversation.
+- A message you send there runs through **the exact same pipeline** as a real WhatsApp message — `app/turn_pipeline.py`'s `process_incoming_message()` is the one function both the webhook and `/simulate` call — so it hits the same guardrails, escalation policy, lead extraction, `clinic_faq_lookup` tool, and grounding checks. The reply lands on `/staff` as an ordinary pending draft, indistinguishable from a real one except for the `SIM-` sender.
+- The one deliberate difference is on approval: `/staff` recognizes a `SIM-` sender and **skips the WhatsApp API call entirely** (`app/staff.py`'s `approve_draft` checks `is_simulated_sender()`). The approved (or edited) text is simply marked delivered, and the `/simulate` chat — which polls `/simulate/messages` every 2 seconds — shows it appear as a reply. A rejected draft shows a muted "Staff rejected this reply" note instead, matching what a real patient would experience (nothing).
+- **Load demo scenario** seeds five ready-made conversations in one click: a Hinglish price question (`RCT ka kitna lagega?`), a booking with name/concern/day given up front, a Hindi emergency (escalates instantly, urgent, no LLM call), an angry patient (escalates to a human), and spam. Clicking it again continues the same five conversations rather than creating new ones.
+
+Walkthrough for a live demo:
+1. Open `/simulate`, click **Load demo scenario**.
+2. Open `/staff` in a second tab — five drafts are waiting, the emergency and angry ones pinned at the top under **URGENT**.
+3. Approve a couple, reject one, edit one before approving.
+4. Switch back to `/simulate` (or wait 2 seconds) — approved replies appear as green bubbles; the rejected one shows the muted note. Nothing ever touched WhatsApp.
+5. Type a follow-up in any conversation (e.g. reply to the booking one with a phone number) to show the one-question-at-a-time flow continuing live.
+
+> [!NOTE]
+> `/simulate` has the same lack of authentication as `/staff` — it's a local demo tool. It doesn't expose anything `/staff` doesn't already (draft text, masked-free `SIM-` ids), but keep both off the public internet.
+
 ### Tests
 
 `tests/test_dental_conversations.py` runs 24 realistic patient messages through the real webhook and orchestrator with a fake LLM:
@@ -67,7 +97,7 @@ The response is `{"status":"pending_approval", ..., "is_urgent":true}`. Refresh 
 - an angry patient
 - eight emergencies, including Devanagari ones
 
-It asserts that emergencies escalate urgently and never reach the booking flow, and that normal messages end up as pending drafts, not immediate sends. `tests/test_staff.py` covers the queue and the staff page. Run everything with `pytest`.
+It asserts that emergencies escalate urgently and never reach the booking flow, and that normal messages end up as pending drafts, not immediate sends. `tests/test_staff.py` covers the queue and the staff page. `tests/test_simulate.py` covers `/simulate` itself, including the core guarantee: approving a `SIM-` draft never calls the WhatsApp client, while approving a real-number draft still does (a direct contrast test, not just an absence check). Run everything with `pytest`.
 
 ### Known limitations
 

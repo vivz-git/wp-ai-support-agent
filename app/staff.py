@@ -18,6 +18,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app.approval import Draft, DraftQueue
 from app.config import mask_phone_number
 from app.dependencies import get_draft_queue, get_whatsapp_client
+from app.simulate import is_simulated_sender
+from app.ui_style import BASE_STYLE
 from app.whatsapp.client import WhatsAppClient, WhatsAppClientError
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,14 @@ async def approve_draft(
         return _redirect("already_handled", draft_id)
 
     draft = queue.get(draft_id)
+    if is_simulated_sender(draft.sender):
+        # A demo patient: never call the real WhatsApp API. The approved text
+        # is already stored (claim_for_sending set it); just mark it sent so
+        # /simulate picks it up on its next poll.
+        queue.mark_sent(draft_id)
+        logger.info("Draft %d approved for simulated patient %s (no WhatsApp call)", draft_id, draft.sender)
+        return _redirect("sent", draft_id)
+
     try:
         await wa_client.send_text(to=draft.sender, body=draft.draft_text)
     except Exception as exc:
@@ -125,40 +135,6 @@ async def staff_page(
 
 _e = html.escape
 
-_STYLE = """
-:root { --bg:#f6f7f9; --card:#fff; --text:#1c1f24; --muted:#5f6670; --border:#dde1e6;
-        --urgent:#c62828; --urgent-bg:#fdecea; --accent:#0b6e4f; --notice-bg:#e8f4ef; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg:#15171a; --card:#1f2226; --text:#e8eaed; --muted:#a0a6ad; --border:#33373d;
-          --urgent:#ff6b6b; --urgent-bg:#3a1f1f; --accent:#4cc38a; --notice-bg:#1d3329; }
-}
-* { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--text);
-       font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Devanagari",sans-serif; }
-main { max-width:860px; margin:0 auto; padding:16px; }
-h1 { font-size:1.35rem; margin:8px 0 4px; }
-h2 { font-size:1.05rem; margin:28px 0 10px; color:var(--muted); }
-.sub { color:var(--muted); margin:0 0 16px; }
-.notice { background:var(--notice-bg); border:1px solid var(--accent); border-radius:8px; padding:10px 12px; margin-bottom:16px; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
-.card.urgent { border:2px solid var(--urgent); background:var(--urgent-bg); }
-.meta { display:flex; flex-wrap:wrap; gap:8px 14px; color:var(--muted); font-size:.85rem; margin-bottom:8px; }
-.badge { background:var(--urgent); color:#fff; font-weight:700; border-radius:4px; padding:1px 7px; letter-spacing:.03em; }
-.label { font-size:.8rem; font-weight:600; color:var(--muted); margin:10px 0 4px; }
-.patient { white-space:pre-wrap; overflow-wrap:anywhere; }
-textarea { width:100%; min-height:140px; font:inherit; color:var(--text); background:var(--card);
-           border:1px solid var(--border); border-radius:6px; padding:8px; }
-.actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
-button { font:inherit; border-radius:6px; padding:7px 14px; cursor:pointer; border:1px solid var(--border);
-         background:var(--card); color:var(--text); }
-button.approve { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
-button.reject { color:var(--urgent); border-color:var(--urgent); }
-.empty { color:var(--muted); }
-.recent { font-size:.9rem; }
-.recent .card { padding:10px 12px; }
-a { color:var(--accent); }
-"""
-
 
 def _pending_card(draft: Draft) -> str:
     urgent_class = " urgent" if draft.is_urgent else ""
@@ -200,10 +176,11 @@ def _render_page(pending: List[Draft], recent: List[Draft], notice: Optional[str
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SmileCare Reply Approvals</title>
-<style>{_STYLE}</style>
+<style>{BASE_STYLE}</style>
 </head>
 <body>
 <main>
+  <nav class="top-links"><a href="/staff">Staff approvals</a><span>·</span><a href="/simulate">Simulator</a></nav>
   <h1>SmileCare Dental: reply approvals</h1>
   <p class="sub">{len(pending)} waiting, {urgent_count} urgent. Nothing reaches a patient until it is approved here. <a href="/staff">Refresh</a></p>
   {notice_html}
