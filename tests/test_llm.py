@@ -140,7 +140,7 @@ def test_format_messages_agent_prompt_builder_yields_single_system_message():
     knowledge = get_knowledge_base()
     state = ConversationState.new("919876543210")
     state.begin_turn()
-    state.set_intent(Intent.PRODUCT_INQUIRY, 0.87)
+    state.set_intent(Intent.SERVICE_INQUIRY, 0.87)
     bundle = PromptBuilder.build(state=state, knowledge=knowledge, current_message="Hi, what's fresh?")
     messages = bundle.to_messages()
 

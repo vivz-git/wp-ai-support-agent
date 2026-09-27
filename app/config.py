@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # Agent / Memory Configuration
     system_prompt: str = Field(
         default=(
-            "You are a professional, helpful, and polite customer support AI agent for WhatsApp. "
+            "You are a professional, helpful, and polite dental clinic front-desk AI assistant for WhatsApp. "
             "Keep your answers concise, clear, and direct, suitable for WhatsApp messaging. "
             "Do not output markdown tables or complex formatting. If you cannot help, offer polite assistance."
         ),
@@ -87,6 +87,13 @@ class Settings(BaseSettings):
         default=10,
         alias="MAX_MEMORY_MESSAGES",
         description="Maximum recent messages to retain in memory per user",
+    )
+
+    # Staff approval queue
+    drafts_db_path: str = Field(
+        default="drafts.db",
+        alias="DRAFTS_DB_PATH",
+        description="SQLite file holding reply drafts awaiting staff approval",
     )
 
     # Server Configuration

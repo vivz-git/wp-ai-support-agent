@@ -5,25 +5,22 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
+from app.agent.escalation import EscalationAction
 from app.agent.extraction import LeadExtractor
 from app.agent.handoff import InMemoryHandoffSink
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.store import ConversationStore
+from app.approval import DraftQueue
 from app.config import Settings, get_settings, mask_phone_number
+from app.dependencies import get_draft_queue, get_whatsapp_client  # noqa: F401 (re-exported for dependency overrides)
 from app.knowledge import KnowledgeBase, get_knowledge_base
 from app.llm.base import LLMProvider
 from app.llm.groq_provider import GroqProvider
 from app.memory import InMemoryConversationMemory
+from app.staff import router as staff_router
 from app.tools import default_registry
 from app.tools.registry import ToolRegistry
-from app.whatsapp.client import WhatsAppClient, WhatsAppClientError
 from app.whatsapp.models import parse_incoming_webhook
-
-# Meta error code for "Recipient phone number not in allowed list" — returned when
-# sending to a number that isn't a verified tester on a WhatsApp Cloud API test number
-# (this is exactly what happens when replying to Meta's webhook dashboard test/simulator
-# event, whose sender is a synthetic number, not a real customer).
-META_RECIPIENT_NOT_ALLOWED_ERROR_CODE = 131030
 
 # Configure structured logging
 logging.basicConfig(
@@ -40,7 +37,6 @@ _global_handoff_sink = InMemoryHandoffSink()
 _global_tool_registry = default_registry
 
 _cached_llm_provider: Optional[Tuple[str, str, str, LLMProvider]] = None
-_cached_wa_client: Optional[Tuple[str, str, str, WhatsAppClient]] = None
 _cached_orchestrator: Optional[Tuple[int, int, int, int, int, int, AgentOrchestrator]] = None
 
 
@@ -89,25 +85,6 @@ def get_lead_extractor(llm: LLMProvider = Depends(get_llm_provider)) -> LeadExtr
     return LeadExtractor(llm=llm)
 
 
-def get_whatsapp_client(settings: Settings = Depends(get_settings)) -> WhatsAppClient:
-    """Dependency provider for WhatsApp Cloud API client, cached by configuration."""
-    global _cached_wa_client
-    cache_key = (
-        settings.whatsapp_access_token,
-        settings.whatsapp_phone_number_id,
-        settings.whatsapp_api_version,
-    )
-    if _cached_wa_client is not None and _cached_wa_client[:3] == cache_key:
-        return _cached_wa_client[3]
-    client = WhatsAppClient(
-        access_token=settings.whatsapp_access_token,
-        phone_number_id=settings.whatsapp_phone_number_id,
-        api_version=settings.whatsapp_api_version,
-    )
-    _cached_wa_client = (*cache_key, client)
-    return client
-
-
 def get_orchestrator(
     llm: LLMProvider = Depends(get_llm_provider),
     knowledge: KnowledgeBase = Depends(get_knowledge),
@@ -142,7 +119,7 @@ def get_orchestrator(
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     settings = get_settings()
-    logger.info("Initializing AI WhatsApp Support Agent (Milestone 2)...")
+    logger.info("Initializing SmileCare Dental WhatsApp assistant...")
     # Pre-warm cached knowledge base at service startup
     get_knowledge_base()
     logger.info("FastAPI service ready. Configured API version: %s", settings.whatsapp_api_version)
@@ -152,10 +129,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI WhatsApp Support Agent",
-    description="Portfolio Demo #2 - WhatsApp Cloud API + Groq LLM Assistant",
-    version="0.2.0",
+    description="Portfolio Demo #2 - SmileCare Dental WhatsApp assistant (Cloud API + Groq) with staff approval",
+    version="0.3.0",
     lifespan=lifespan,
 )
+app.include_router(staff_router)
 
 
 @app.get("/health", tags=["System"])
@@ -197,16 +175,17 @@ async def receive_webhook(
     settings: Settings = Depends(get_settings),
     memory: InMemoryConversationMemory = Depends(get_memory),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
-    wa_client: WhatsAppClient = Depends(get_whatsapp_client),
+    drafts: DraftQueue = Depends(get_draft_queue),
 ):
     """Meta WhatsApp Cloud API event notification receiver.
-    
+
     Receives incoming webhook payloads from Meta:
     - Parses text messages safely
     - Ignores status notifications and unsupported media without crashing
     - Deduplicates delivery using transport-level WAMID ledger
     - Dispatches to AgentOrchestrator
-    - Sends assistant response back via WhatsApp Cloud API
+    - Queues the reply as a draft for staff approval (``/staff``); nothing is
+      sent to the patient from here
     - Returns HTTP 200
     """
     try:
@@ -286,32 +265,33 @@ async def receive_webhook(
         logger.debug("Agent turn failure detail", exc_info=exc)
         return {"status": "agent_error", "message_id": msg.message_id}
 
-    reply_text = turn_result.reply_text
-
-    # Deliver reply via WhatsApp Cloud API
+    # Human approval layer: the reply is never sent from the webhook. Staff approve
+    # (optionally edit) it on /staff, which is the only path to wa_client.send_text.
+    is_urgent = turn_result.diagnostics.escalation_action == EscalationAction.ESCALATE.value
     try:
-        await wa_client.send_text(to=sender, body=reply_text)
-    except WhatsAppClientError as exc:
-        if exc.error_code == META_RECIPIENT_NOT_ALLOWED_ERROR_CODE:
-            # Expected for Meta's webhook dashboard test/simulator event, whose synthetic
-            # sender is never a verified recipient on a test number. Not a real failure.
-            logger.info(
-                "Skipped reply delivery: sender %s is not an allowed test recipient "
-                "(Meta test/simulator event, error code %s)",
-                masked_sender,
-                exc.error_code,
-            )
-        else:
-            logger.error(
-                "Failed to deliver WhatsApp reply to %s: %s",
-                masked_sender,
-                type(exc).__name__,
-            )
-            logger.debug("WhatsApp delivery failure detail", exc_info=exc)
-        return {"status": "send_failed", "message_id": msg.message_id}
+        draft = drafts.add(
+            sender=sender,
+            patient_message=text,
+            draft_text=turn_result.reply_text,
+            is_urgent=is_urgent,
+        )
+    except Exception as exc:
+        logger.error("Failed to queue reply draft for %s: %s", masked_sender, type(exc).__name__)
+        logger.debug("Draft queue failure detail", exc_info=exc)
+        return {"status": "queue_error", "message_id": msg.message_id}
 
-    logger.info("Completed reply cycle for %s", masked_sender)
-    return {"status": "ok", "message_id": msg.message_id}
+    logger.info(
+        "Queued reply draft %d for %s (urgent=%s); awaiting staff approval",
+        draft.id,
+        masked_sender,
+        is_urgent,
+    )
+    return {
+        "status": "pending_approval",
+        "message_id": msg.message_id,
+        "draft_id": draft.id,
+        "is_urgent": is_urgent,
+    }
 
 
 if __name__ == "__main__":

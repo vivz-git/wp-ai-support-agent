@@ -1,4 +1,4 @@
-"""Tests for the business-aware prompt assembly layer (app/agent/prompts.py).
+"""Tests for the clinic-aware prompt assembly layer (app/agent/prompts.py).
 
 These tests are self-contained: they build ``ConversationState`` directly and
 load the real (fictional) knowledge base via ``app.knowledge.get_knowledge_base``,
@@ -39,54 +39,80 @@ def knowledge():
 def state() -> ConversationState:
     s = ConversationState.new("919876543210")
     s.begin_turn()
-    s.set_intent(Intent.PRODUCT_INQUIRY, 0.87)
-    s.apply_lead_delta(LeadDelta(contact_name="Asha", city="Pune"))
-    s.add_user_message("Hi, tell me about your filter coffee.")
-    s.add_assistant_message("Sure! We have a few great filter options.")
+    s.set_intent(Intent.SERVICE_INQUIRY, 0.87)
+    s.apply_lead_delta(LeadDelta(patient_name="Asha", concern="braces"))
+    s.add_user_message("Hi, do you do braces?")
+    s.add_assistant_message("Yes, we offer metal and ceramic braces.")
     return s
 
 
-def _build(state, knowledge, message="What's the price of your Ethiopia filter roast?", **kwargs):
+def _build(state, knowledge, message="Braces ka kitna lagega?", **kwargs):
     return PromptBuilder.build(state=state, knowledge=knowledge, current_message=message, **kwargs)
 
 
 # 1. persona included
 def test_persona_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert "Bloom" in bundle.system_prompt
+    assert "SmileCare Assistant" in bundle.system_prompt
     assert "AI assistant" in bundle.system_prompt
+    assert "front-desk" in bundle.system_prompt
+    assert "Bloom" not in bundle.system_prompt
+    assert "coffee" not in bundle.system_prompt.lower()
 
 
-# 2. business name included
-def test_business_name_included(state, knowledge):
+# 2. clinic name included
+def test_clinic_name_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert knowledge.business.name in bundle.system_prompt
+    assert knowledge.clinic.name in bundle.system_prompt
 
 
-# 3. business facts included
-def test_business_facts_included(state, knowledge):
+# 3. clinic facts included
+def test_clinic_facts_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert knowledge.business.shipping_policy.summary in bundle.system_prompt
-    assert knowledge.business.return_policy.summary in bundle.system_prompt
+    assert knowledge.clinic.address in bundle.system_prompt
+    assert knowledge.clinic.phone in bundle.system_prompt
+    assert "Sunday: closed" in bundle.system_prompt
+    for dentist in knowledge.clinic.dentists:
+        assert dentist.name in bundle.system_prompt
+
+
+# 3b. medical safety rules included
+def test_medical_safety_rules_included(state, knowledge):
+    prompt = _build(state, knowledge).system_prompt
+    assert "Medical safety (strict):" in prompt
+    assert "Never give medical advice" in prompt
+    assert "Never diagnose" in prompt
+    assert "medicine, painkiller, antibiotic, or home remedy" in prompt
+    assert "Never confirm an appointment slot yourself" in prompt
+
+
+# 3c. language/script mirroring rules included
+def test_language_rules_included(state, knowledge):
+    prompt = _build(state, knowledge).system_prompt
+    assert "same language AND script" in prompt
+    assert "Devanagari" in prompt
+    assert "Hinglish" in prompt
+    assert "Never switch the patient to a different language or script" in prompt
 
 
 # 4. current intent included
 def test_current_intent_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert "product_inquiry" in bundle.system_prompt
+    assert "service_inquiry" in bundle.system_prompt
 
 
-# 5. qualification state included
+# 5. booking/qualification state included
 def test_qualification_state_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert f"qualification: {state.qualification.value}" in bundle.system_prompt
+    assert f"booking_request: {state.qualification.value}" in bundle.system_prompt
 
 
-# 6. lead summary included
+# 6. booking details summary included
 def test_lead_summary_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert "Asha" in bundle.system_prompt
-    assert "Pune" in bundle.system_prompt
+    assert "name=Asha" in bundle.system_prompt
+    assert "concern=braces" in bundle.system_prompt
+    assert "phone=WhatsApp number on file" in bundle.system_prompt
 
 
 # 7. escalation state included
@@ -100,7 +126,7 @@ def test_history_included(state, knowledge):
     bundle = _build(state, knowledge)
     assert len(bundle.history) == 2
     assert bundle.history[0].role == "user"
-    assert bundle.history[0].content == "Hi, tell me about your filter coffee."
+    assert bundle.history[0].content == "Hi, do you do braces?"
     assert bundle.history[1].role == "assistant"
 
 
@@ -126,21 +152,23 @@ def test_injection_wording_is_only_delimited_content(state, knowledge):
 # 11. tool-use instructions included
 def test_tool_use_instructions_included(state, knowledge):
     bundle = _build(state, knowledge)
-    assert "product_lookup" in bundle.system_prompt
-    assert "price" in bundle.system_prompt.lower()
+    assert "clinic_faq_lookup" in bundle.system_prompt
+    assert "Before you state ANY price or price range" in bundle.system_prompt
+    assert "product_lookup" not in bundle.system_prompt
 
 
 # 12. allowed qualification question included when supplied
 def test_allowed_question_included(state, knowledge):
-    question = "What's your city so I can check delivery times?"
+    question = "Which day and time would suit you for the visit?"
     bundle = _build(state, knowledge, allowed_question=question)
     assert question in bundle.system_prompt
+    assert "ONE missing detail per message" in bundle.system_prompt
 
 
 # 13. no qualification question when none supplied
 def test_no_qualification_question_when_absent(state, knowledge):
     bundle = _build(state, knowledge, allowed_question=None)
-    assert "No qualification question is authorized" in bundle.system_prompt
+    assert "No booking question is authorized" in bundle.system_prompt
 
 
 # 14. tool results included only when supplied
@@ -148,10 +176,10 @@ def test_tool_results_included_only_when_supplied(state, knowledge):
     bundle_without = _build(state, knowledge, tool_results=None)
     assert "Tool results for this turn" not in bundle_without.system_prompt
 
-    results = [{"sku": "KB-ETH-001", "name": "Ethiopia Yirgacheffe", "price_inr": 650}]
+    results = [{"kind": "service", "id": "svc-braces", "title": "Braces", "price_range": "₹35,000–₹90,000"}]
     bundle_with = _build(state, knowledge, tool_results=results)
     assert "Tool results for this turn" in bundle_with.system_prompt
-    assert "KB-ETH-001" in bundle_with.system_prompt
+    assert "svc-braces" in bundle_with.system_prompt
 
 
 # 15/16/17. no secrets ever appear in the assembled system prompt
@@ -205,10 +233,15 @@ def test_prompt_assembly_is_deterministic(state, knowledge):
 # 21. prompt has no accidental duplicate sections
 def test_no_duplicate_sections(state, knowledge):
     bundle = _build(state, knowledge)
-    assert bundle.system_prompt.count("Lead qualification policy:") == 1
-    assert bundle.system_prompt.count("Tool-use policy:") == 1
-    assert bundle.system_prompt.count("Escalation policy:") == 1
-    assert bundle.system_prompt.count("Untrusted customer content:") == 1
+    for header in (
+        "Booking request policy:",
+        "Tool-use policy:",
+        "Escalation policy:",
+        "Untrusted patient content:",
+        "Medical safety (strict):",
+        "Language:",
+    ):
+        assert bundle.system_prompt.count(header) == 1
 
 
 # 22. message ordering is deterministic
@@ -217,7 +250,7 @@ def test_message_ordering(state, knowledge):
     messages = bundle.to_messages()
     assert messages[0].role == "system"
     assert messages[1].role == "user"
-    assert messages[1].content == "Hi, tell me about your filter coffee."
+    assert messages[1].content == "Hi, do you do braces?"
     assert messages[2].role == "assistant"
     assert messages[-1].role == "user"
     assert messages[-1].content == bundle.current_user_message
@@ -256,11 +289,22 @@ def test_empty_history_state_produces_valid_prompt(knowledge):
     fresh_state = ConversationState.new("15550001234")
     bundle = _build(fresh_state, knowledge, message="Hello")
     assert bundle.history == []
-    assert "Bloom" in bundle.system_prompt
+    assert "SmileCare Assistant" in bundle.system_prompt
     assert isinstance(bundle, PromptBundle)
 
 
 def test_state_with_no_lead_data_has_safe_summary(knowledge):
     fresh_state = ConversationState.new("15550001234")
     bundle = _build(fresh_state, knowledge, message="Hi")
-    assert "no lead details captured yet" in bundle.system_prompt
+    assert "booking_details: phone=WhatsApp number on file" in bundle.system_prompt
+    non_whatsapp = ConversationState.new("web-session-1")
+    assert "booking_details: no booking details captured yet" in _build(non_whatsapp, knowledge).system_prompt
+
+
+def test_patient_stated_phone_is_not_echoed_into_prompt(knowledge):
+    s = ConversationState.new("919876543210")
+    s.begin_turn()
+    s.apply_lead_delta(LeadDelta(phone="9123456789"))
+    prompt = _build(s, knowledge).system_prompt
+    assert "phone=given by patient" in prompt
+    assert "9123456789" not in prompt

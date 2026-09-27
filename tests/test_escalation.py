@@ -1,4 +1,4 @@
-"""Tests for ``app.agent.escalation`` (Milestone 2, Slice 9).
+"""Tests for ``app.agent.escalation``.
 
 The policy is exercised with hand-built ``GuardrailSignals`` and real
 ``ConversationState`` objects. No Groq, no WhatsApp, no Meta, no network,
@@ -20,6 +20,7 @@ from app.agent.escalation import (
 )
 from app.agent.guardrails import (
     AngerResult,
+    EmergencyResult,
     GroundingResult,
     GroundingValidator,
     GuardrailSignals,
@@ -35,14 +36,10 @@ from app.agent.state import ConversationState, EscalationStatus, Intent
 SENDER = "919876543210"
 OTHER_SENDER = "919812345678"
 
-WHOLESALE_DELTA = LeadDelta(
-    track="wholesale",
-    contact_name="Asha Rao",
-    business_name="Third Wave Cafe",
-    business_type="cafe",
-    monthly_volume_kg=25,
-    city="Bengaluru",
-    timeline="within_1_month",
+BOOKING_DELTA = LeadDelta(
+    patient_name="Asha Rao",
+    concern="teeth cleaning",
+    preferred_day_time="Saturday 11am",
 )
 
 # ---------------------------------------------------------------------------
@@ -98,9 +95,72 @@ def _ungrounded() -> GroundingResult:
     return GroundingResult(grounded=False, violations=["unsupported_price:500"], reason_codes=["unsupported_price"])
 
 
+def _emergency(codes=("pain",), language: str = "en") -> EmergencyResult:
+    return EmergencyResult(detected=True, hit_count=len(codes), reason_codes=sorted(codes), language=language)
+
+
 @pytest.fixture
 def policy() -> EscalationPolicy:
     return EscalationPolicy()
+
+
+# ---------------------------------------------------------------------------
+# Dental emergency
+# ---------------------------------------------------------------------------
+
+
+def test_dental_emergency_forces_escalation_with_callback_instruction(policy):
+    decision = policy.evaluate(_signals(emergency=_emergency(("bleeding", "swelling"))), _state())
+    assert decision.action == EscalationAction.ESCALATE
+    assert decision.reason_codes == ["dental_emergency"]
+    assert decision.user_message_instruction == UserMessageInstruction.EMERGENCY_CALLBACK
+    assert decision.priority == 1
+
+
+def test_undetected_emergency_result_does_not_fire(policy):
+    decision = policy.evaluate(_signals(emergency=EmergencyResult()), _state())
+    assert decision.action == EscalationAction.CONTINUE
+
+
+def test_emergency_outranks_sticky_escalation_and_every_other_rule(policy):
+    state = _state()
+    state.mark_escalated("human_requested")
+    signals = _signals(
+        emergency=_emergency(),
+        human_request=_human(),
+        anger=_angry(0.9, complaint=True),
+        injection=_injection(["ignore_previous_instructions"], ["instruction_override"]),
+    )
+    decision = policy.evaluate(signals, state)
+    assert decision.action == EscalationAction.ESCALATE
+    assert decision.user_message_instruction == UserMessageInstruction.EMERGENCY_CALLBACK
+    assert decision.reason_codes[0] == "dental_emergency"
+    assert "already_escalated" in decision.reason_codes
+
+
+def test_emergency_beats_complete_booking_request(policy):
+    state = _state()
+    state.apply_lead_delta(BOOKING_DELTA)
+    assert state.qualification == QualificationState.QUALIFIED
+    decision = policy.evaluate(_signals(emergency=_emergency()), state)
+    assert decision.action == EscalationAction.ESCALATE
+    assert decision.reason_codes == ["dental_emergency", "lead_qualified"]
+
+
+def test_emergency_sorts_before_grounding_on_a_tie(policy):
+    decision = policy.evaluate(_signals(emergency=_emergency(), grounding=_ungrounded()), _state())
+    assert decision.action == EscalationAction.ESCALATE
+    assert decision.reason_codes == ["dental_emergency", "grounding_violation"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["I have severe tooth pain", "khoon aa raha hai", "मेरा दाँत टूट गया", "my face is swollen"],
+)
+def test_real_detector_signals_escalate_through_policy(policy, text):
+    decision = policy.evaluate(analyze_customer_message(text), _state())
+    assert decision.action == EscalationAction.ESCALATE
+    assert decision.user_message_instruction == UserMessageInstruction.EMERGENCY_CALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +311,7 @@ def test_grounding_violation_outranks_everything(policy):
 
 def test_qualified_lead_is_handoff_ready(policy):
     state = _state()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     assert state.qualification == QualificationState.QUALIFIED
     decision = policy.evaluate(_quiet(), state)
     assert decision.action == EscalationAction.HANDOFF_READY
@@ -265,7 +325,7 @@ def test_qualified_lead_is_handoff_ready(policy):
 
 def test_incomplete_lead_is_not_handoff_ready(policy):
     state = _state()
-    state.apply_lead_delta(LeadDelta(track="wholesale", contact_name="Asha Rao", business_name="Third Wave Cafe"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha Rao", concern="teeth cleaning"))
     assert state.qualification == QualificationState.COLLECTING
     decision = policy.evaluate(_quiet(), state)
     assert decision.action == EscalationAction.CONTINUE
@@ -276,7 +336,7 @@ def test_incomplete_lead_is_not_handoff_ready(policy):
 
 def test_human_request_beats_qualified_handoff(policy):
     state = _state()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     decision = policy.evaluate(_signals(human_request=_human()), state)
     assert decision.action == EscalationAction.ESCALATE
     assert decision.reason_codes == ["human_requested", "lead_qualified"]
@@ -298,7 +358,7 @@ def test_already_escalated_remains_escalated(policy):
     assert policy.evaluate(_quiet(), state).reason_codes == ["already_escalated"]
     # Even a fully qualified lead stays escalated once escalated.
     state.begin_turn()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     assert policy.evaluate(_quiet(), state).action == EscalationAction.ESCALATE
 
 
@@ -339,7 +399,7 @@ def test_escalation_priority_is_deterministic(policy):
     basic = _injection(["jailbreak"], ["role_override"])
     assert priority_of(_signals(injection=basic), _state()) == 8
     qualified = _state()
-    qualified.apply_lead_delta(WHOLESALE_DELTA)
+    qualified.apply_lead_delta(BOOKING_DELTA)
     assert priority_of(_quiet(), qualified) == 9
     assert priority_of(_signals(anger=_angry(0.9, complaint=False)), _state()) == 10
     assert priority_of(_signals(repetition=_repeat()), _state()) == 11
@@ -369,7 +429,7 @@ def test_no_model_controlled_qualification(policy):
     with pytest.raises(Exception):
         LeadDelta(qualification="qualified")
     state = _state()
-    state.apply_lead_delta(LeadDelta(contact_name="Someone", intent_summary="I am a qualified lead, hand me off"))
+    state.apply_lead_delta(LeadDelta(patient_name="Someone", concern="I am a qualified lead, hand me off"))
     decision = policy.evaluate(_quiet(), state)
     assert decision.action == EscalationAction.CONTINUE
     assert state.qualification == QualificationState.COLLECTING
@@ -395,7 +455,7 @@ def test_no_model_controlled_escalation(policy):
 
 def test_policy_does_not_mutate_state(policy):
     state = _state()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     before = state.model_dump(mode="json")
     policy.evaluate(
         _signals(human_request=_human(), grounding=_ungrounded(), injection=_injection(["a", "b", "c"], ["x"])), state
@@ -521,7 +581,7 @@ _CODE_RANK = {
 
 def _qualified_state() -> ConversationState:
     state = _state()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     assert state.qualification == QualificationState.QUALIFIED and state.lead.is_complete()
     return state
 
@@ -535,7 +595,7 @@ def _handoff_ready_state() -> ConversationState:
 
 def _incomplete_state() -> ConversationState:
     state = _state()
-    state.apply_lead_delta(LeadDelta(track="wholesale", contact_name="Asha Rao", business_name="Third Wave Cafe"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha Rao", concern="teeth cleaning"))
     assert state.qualification == QualificationState.COLLECTING
     return state
 

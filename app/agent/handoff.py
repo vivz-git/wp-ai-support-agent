@@ -15,7 +15,7 @@ Responsibilities, in order:
   escalation should happen. Only ``escalate`` and ``handoff_ready`` produce
   a request. It reads ``state`` and never mutates it.
 - ``HandoffRequest``: the minimum a human needs to pick the conversation
-  up — why, how urgent, what we know about the lead, and the bounded
+  up — why, how urgent, what we know about the patient, and the bounded
   customer/assistant transcript. Nothing else. No prompts, no provider
   output, no tool internals, no credentials, no raw phone number.
 - ``HandoffSink`` / ``InMemoryHandoffSink``: the consumer protocol and its
@@ -24,9 +24,8 @@ Responsibilities, in order:
   problems as a rejected ``HandoffResult`` rather than by crashing the
   agent.
 
-Design constraints (Milestone 2, Slice 11):
+Design constraints:
 - No network, no external services, no settings/env access.
-- Not wired into ``app.main`` or the orchestrator yet.
 - No module-level sink instance: callers construct and own their sink.
 """
 
@@ -81,7 +80,7 @@ class HandoffKind(str, Enum):
     """Why a human is being asked in: a problem, or a sales opportunity."""
 
     ESCALATION = "escalation"  # from EscalationAction.ESCALATE
-    QUALIFIED_LEAD = "qualified_lead"  # from EscalationAction.HANDOFF_READY
+    QUALIFIED_LEAD = "qualified_lead"  # from EscalationAction.HANDOFF_READY (complete booking request)
 
 
 class HandoffStatus(str, Enum):
@@ -105,6 +104,7 @@ class HandoffOutcome(str, Enum):
 # fall back per kind (``_DEFAULT_PRIORITY``) so a new policy rule can never
 # produce an unprioritized handoff.
 _REASON_PRIORITY: Dict[str, HandoffPriority] = {
+    "dental_emergency": HandoffPriority.URGENT,
     "high_anger_complaint": HandoffPriority.URGENT,
     "human_requested": HandoffPriority.HIGH,
     "repeated_unresolved": HandoffPriority.HIGH,
@@ -175,59 +175,36 @@ def conversation_id_for(sender_id: str) -> str:
 
 
 class LeadSnapshot(BaseModel):
-    """What a human needs to know about the lead. Nothing else.
+    """What a human needs to know about the patient's booking request. Nothing else.
 
-    Built only from validated ``LeadProfile`` fields. ``whatsapp_number``,
-    ``field_provenance`` and ``source`` are deliberately absent: the number
-    is PII the human reaches through the conversation, and the rest is
-    agent bookkeeping.
+    Built only from validated ``LeadProfile`` fields. ``callback_phone`` is
+    passed through the sender redactor, so when it is the WhatsApp number it
+    appears masked: staff reach that patient through the conversation.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    lead_track: str
     qualification: str
-    contact_name: Optional[str] = None
-    business_name: Optional[str] = None
-    business_type: Optional[str] = None
-    city: Optional[str] = None
-    email: Optional[str] = None
-    monthly_volume_kg: Optional[float] = None
-    timeline: Optional[str] = None
-    intent_summary: Optional[str] = None
+    patient_name: Optional[str] = None
+    callback_phone: Optional[str] = None
+    concern: Optional[str] = None
+    preferred_day_time: Optional[str] = None
     missing_required_fields: List[str] = Field(default_factory=list)
 
     @classmethod
     def from_lead(cls, lead: LeadProfile, qualification: QualificationState, redact: Callable[[str], str]) -> "LeadSnapshot":
         return cls(
-            lead_track=lead.effective_track().value,
             qualification=qualification.value,
-            contact_name=_redact_optional(lead.contact_name, redact),
-            business_name=_redact_optional(lead.business_name, redact),
-            business_type=lead.business_type.value if lead.business_type is not None else None,
-            city=_redact_optional(lead.city, redact),
-            email=lead.email,
-            monthly_volume_kg=lead.monthly_volume_kg,
-            timeline=lead.timeline.value if lead.timeline is not None else None,
-            intent_summary=_redact_optional(lead.intent_summary, redact),
+            patient_name=_redact_optional(lead.patient_name, redact),
+            callback_phone=_redact_optional(lead.callback_phone(), redact),
+            concern=_redact_optional(lead.concern, redact),
+            preferred_day_time=_redact_optional(lead.preferred_day_time, redact),
             missing_required_fields=list(lead.missing_required_fields()),
         )
 
     def is_empty(self) -> bool:
-        """True when nothing beyond track/qualification is known."""
-        return all(
-            getattr(self, name) is None
-            for name in (
-                "contact_name",
-                "business_name",
-                "business_type",
-                "city",
-                "email",
-                "monthly_volume_kg",
-                "timeline",
-                "intent_summary",
-            )
-        )
+        """True when the patient has shared nothing yet."""
+        return all(getattr(self, name) is None for name in ("patient_name", "concern", "preferred_day_time"))
 
 
 class TranscriptEntry(BaseModel):
@@ -380,23 +357,19 @@ def _derive_priority(kind: HandoffKind, reason_codes: List[str]) -> HandoffPrior
 
 def _build_summary(kind: HandoffKind, reason_codes: List[str], lead: LeadSnapshot, sender_masked: str, turn: int) -> str:
     """One deterministic line a human can read before opening the transcript."""
-    head = "Escalation" if kind == HandoffKind.ESCALATION else "Qualified lead"
+    head = "Escalation" if kind == HandoffKind.ESCALATION else "Booking request"
     parts = [f"{head} for {sender_masked} after {turn} turn{'s' if turn != 1 else ''} ({', '.join(reason_codes)})."]
-    who: List[str] = []
-    if lead.contact_name:
-        who.append(lead.contact_name)
-    if lead.business_name:
-        who.append(lead.business_name)
-    if lead.business_type:
-        who.append(lead.business_type)
-    if lead.city:
-        who.append(lead.city)
-    if who:
-        parts.append(f"{lead.lead_track.capitalize()} lead: {', '.join(who)}.")
+    details: List[str] = []
+    if lead.patient_name:
+        details.append(f"Patient: {lead.patient_name}")
+    if lead.concern:
+        details.append(f"Concern: {lead.concern}")
+    if lead.preferred_day_time:
+        details.append(f"Preferred: {lead.preferred_day_time}")
+    if details:
+        parts.append(". ".join(details) + ".")
     else:
-        parts.append(f"Lead track: {lead.lead_track}; qualification: {lead.qualification}.")
-    if lead.intent_summary:
-        parts.append(f"Intent: {lead.intent_summary}")
+        parts.append(f"No booking details yet; qualification: {lead.qualification}.")
     return _truncate(" ".join(parts), MAX_SUMMARY_LENGTH)
 
 

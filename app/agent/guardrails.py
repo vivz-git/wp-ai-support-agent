@@ -7,31 +7,33 @@ nothing here mutates ``ConversationState``. The caller owns state mutation;
 ``apply_signals_to_flags`` is the one helper that *computes* the updated
 ``ConversationFlags`` for it, and even that returns a new copy.
 
-Components (Milestone 2, Slice 9):
+Components:
 
-    InjectionDetector   customer text          -> InjectionResult
-    AngerScorer         customer text          -> AngerResult
-    RepetitionDetector  history + text         -> RepetitionResult
-    HumanRequestDetector customer text         -> HumanRequestResult
-    GroundingValidator  model reply + facts    -> GroundingResult
+    InjectionDetector    customer text          -> InjectionResult
+    AngerScorer          customer text          -> AngerResult
+    RepetitionDetector   history + text         -> RepetitionResult
+    HumanRequestDetector customer text          -> HumanRequestResult
+    EmergencyDetector    customer text          -> EmergencyResult
+    GroundingValidator   model reply + facts    -> GroundingResult
 
 Untrusted input: customer text is data. It is normalized, bounded to
 ``MAX_ANALYSIS_LENGTH`` characters, matched against fixed regular expressions
 with bounded quantifiers, and never executed, evaluated, or logged raw.
 Results carry pattern identifiers and codes, never the customer's words.
 
-Not wired into ``app.main`` or the orchestrator; the Milestone 1 webhook is
-untouched.
+Hindi: Python's ``\\w`` and ``\\b`` do not treat Devanagari vowel signs as
+word characters, so Devanagari phrases are matched as plain substrings of the
+NFKC-normalized text, never with ``\\b`` boundaries.
 """
 
 import re
 import unicodedata
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.state import ConversationFlags, HistoryMessage, MAX_MESSAGE_LENGTH, ToolInvocation
-from app.knowledge import KnowledgeBase, Product, build_business_digest
+from app.knowledge import KnowledgeBase, Service, normalize_match_text, strip_punctuation
 
 # ---------------------------------------------------------------------------
 # Bounds
@@ -40,7 +42,7 @@ from app.knowledge import KnowledgeBase, Product, build_business_digest
 MAX_ANALYSIS_LENGTH = MAX_MESSAGE_LENGTH  # analyse at most one WhatsApp message worth of text
 MAX_HISTORY_TURNS_COMPARED = 10  # repetition looks at the last N *customer* turns only
 MAX_SENTENCES = 60  # grounding looks at the first N sentences of a reply
-MAX_FACTS = 100  # product facts considered by the grounding validator
+MAX_FACTS = 100  # service facts considered by the grounding validator
 MAX_VIOLATIONS = 20
 MAX_PATTERN_HITS = 20
 
@@ -50,7 +52,6 @@ ANGER_DECAY = 0.5  # how much of last turn's anger carries into this turn's flag
 
 _ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
 _WHITESPACE_RE = re.compile(r"\s+")
-_PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
 
 
 def normalize_text(text: Any) -> str:
@@ -68,8 +69,7 @@ def normalize_text(text: Any) -> str:
     return _WHITESPACE_RE.sub(" ", normalized).strip().lower()
 
 
-def _strip_punctuation(text: str) -> str:
-    return _WHITESPACE_RE.sub(" ", _PUNCTUATION_RE.sub(" ", text)).strip()
+_strip_punctuation = strip_punctuation
 
 
 def _sorted_unique(values: Iterable[str]) -> List[str]:
@@ -514,152 +514,307 @@ class HumanRequestDetector:
 
 
 # ---------------------------------------------------------------------------
-# 5. Grounding validation
+# 5. Dental emergency detection (pain, bleeding, swelling, trauma)
 # ---------------------------------------------------------------------------
 
+PatientLanguage = Literal["en", "hi", "hinglish"]
 
-class ProductFact(BaseModel):
-    """Structured product facts the validator may treat as ground truth.
+_DEVANAGARI_RE = re.compile("[ऀ-ॿ]")
+# Common Hindi words written in Roman script. Two or more in one message is
+# a reliable Hinglish signal; single words ("hai") appear in English chats too.
+_HINGLISH_MARKERS: FrozenSet[str] = frozenset(
+    """
+    hai hain he ho hoga hota raha rahi rha rhi mein mai mera meri mere mujhe hum aap ka ki ke kya kyu kyun
+    nahi nhi bahut bohot bahot bhi aur kar karo kare karna se toh gaya gayi gya gyi tha thi chahiye kitna
+    kitne kitni lagega lagegi lagta daant dant dard kal parso subah shaam abhi jaldi ji haan theek
+    kahan kaha kidhar kab kaise karwana sakta sakti chahta chahti wala wali
+    """.split()
+)
 
-    ``None`` means "unknown", which is *not* the same as "false": a claim
-    about an unknown attribute is reported as unverifiable.
+
+def detect_language(text: Any) -> PatientLanguage:
+    """Which language/script the patient wrote in: Devanagari Hindi, Hinglish, or English."""
+    normalized = normalize_text(text)
+    if _DEVANAGARI_RE.search(normalized):
+        return "hi"
+    tokens = _strip_punctuation(normalized).split()
+    if sum(1 for token in tokens if token in _HINGLISH_MARKERS) >= 2:
+        return "hinglish"
+    return "en"
+
+
+def _compile_substrings(phrases: Iterable[str]) -> "re.Pattern[str]":
+    """Devanagari phrases: NFKC-normalized plain substrings, no ``\\b``."""
+    normalized = sorted({unicodedata.normalize("NFKC", p).lower() for p in phrases}, key=lambda p: (-len(p), p))
+    return re.compile("|".join(re.escape(p) for p in normalized))
+
+
+# (code, script, pattern). ``latin`` patterns run on the normalized text with
+# ``\b`` boundaries; ``devanagari`` patterns are substring alternations.
+# Questions about a procedure ("is RCT painful?", "RCT mein dard hota hai
+# kya?") deliberately do not match: the patterns need a first-person or
+# present-tense report ("I have tooth pain", "dard ho raha hai").
+_EMERGENCY_PATTERNS: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = (
+    # --- English ---------------------------------------------------------
+    ("pain", "en", re.compile(r"\b(?:tooth ?ache|jaw ?ache)s?\b")),
+    (
+        "pain",
+        "en",
+        re.compile(
+            r"\b(?:severe|bad|terrible|horrible|unbearable|extreme|intense|sharp|throbbing|constant|excruciating)"
+            r" (?:tooth |teeth |jaw |gum |dental )?(?:pain|ache)\b"
+        ),
+    ),
+    (
+        "pain",
+        "en",
+        re.compile(
+            r"\b(?:i have|i've got|i got|i'm having|im having|having|got) (?:a |some |so much |a lot of |lots of )?"
+            r"(?:tooth|teeth|jaw|gum|dental|mouth) (?:pain|ache)\b"
+        ),
+    ),
+    (
+        "pain",
+        "en",
+        re.compile(
+            r"\b(?:tooth|teeth|jaw|gums?|mouth|molar|wisdom tooth) (?:is |are )?(?:really |very |so |still )?"
+            r"(?:hurting|paining|aching|killing me|throbbing)\b"
+        ),
+    ),
+    ("pain", "en", re.compile(r"\b(?:my|the) (?:tooth|teeth|jaw|gums?) (?:really |still )?hurts?\b")),
+    ("pain", "en", re.compile(r"\b(?:i am|i'm|im) in (?:so much |a lot of |severe |terrible )?pain\b")),
+    ("pain", "en", re.compile(r"\bcan'?t (?:sleep|eat|chew|bite)\b.{0,30}\bpain\b|\bpain\b.{0,30}\bcan'?t (?:sleep|eat|chew|bite)\b")),
+    ("bleeding", "en", re.compile(r"\b(?:bleeding|bleeds? (?:a lot|non ?stop|continuously))\b")),
+    (
+        "bleeding",
+        "en",
+        re.compile(r"\b(?:lot of|lots of|so much|too much) blood\b|\bblood (?:is )?(?:coming|flowing|not stopping|won'?t stop)\b|\bspitting blood\b"),
+    ),
+    ("swelling", "en", re.compile(r"\b(?:swollen|abscess|pus)\b")),
+    (
+        "swelling",
+        "en",
+        re.compile(
+            r"\b(?:my|have|has|got|there is|there's|face|cheek|jaw|gum|gums) (?:a |some |big |lot of )?swelling\b"
+            r"|\bswelling (?:in|on|of) (?:my|the)\b|\bswelling (?:is )?(?:increasing|getting worse|spreading)\b"
+        ),
+    ),
+    (
+        "trauma",
+        "en",
+        re.compile(
+            r"\b(?:broke|broken|chipped|cracked|knocked out|knocked|lost|fractured) (?:my |his |her |a |the |one |two )?"
+            r"(?:front |back )?(?:tooth|teeth|jaw)\b"
+        ),
+    ),
+    (
+        "trauma",
+        "en",
+        re.compile(r"\b(?:tooth|teeth) (?:got |is |are |has |have )?(?:broke|broken|chipped|cracked|knocked out|fell out|came out|fallen out|loose)\b"),
+    ),
+    ("trauma", "en", re.compile(r"\b(?:accident|fell|injury|injured|punched|hit)\b.{0,40}\b(?:tooth|teeth|mouth|jaw|face|lip)\b")),
+    ("trauma", "en", re.compile(r"\bjaw (?:is )?(?:locked|stuck|dislocated)\b|\bcan'?t (?:open|close) my (?:mouth|jaw)\b")),
+    # --- Hinglish (Hindi in Roman script) ----------------------------------
+    ("pain", "hinglish", re.compile(r"\b(?:bahut|bohot|bohut|bahot|bht|tez|tej|zyada|jyada|bhayankar|asahniya) dard\b")),
+    ("pain", "hinglish", re.compile(r"\bdard (?:ho )?(?:raha|rha|rahi|rhi)\b|\bdard (?:hai|he|h)\b|\bdard se\b|\bdard ke maa?re\b")),
+    ("pain", "hinglish", re.compile(r"\b(?:daant|dant|daat|daad|jabde|masude|masudo|masoodhe) (?:me|mein|mai|main|mei) (?:bahut |bohot |tez )?dard\b")),
+    ("pain", "hinglish", re.compile(r"\bdukh (?:raha|rha|rahi|rhi)\b")),
+    ("bleeding", "hinglish", re.compile(r"\b(?:khoon|khun) (?:aa|nikal|beh|bah) ?(?:raha|rha|rahi|rhi)\b|\b(?:khoon|khun) (?:band|ruk) (?:nahi|nhi)\b")),
+    ("bleeding", "hinglish", re.compile(r"\b(?:bahut|bohot|zyada|jyada) (?:khoon|khun)\b")),
+    ("swelling", "hinglish", re.compile(r"\b(?:sujan|soojan|sujaan|soojhan|sujhan|mawad|mavaad)\b")),
+    ("swelling", "hinglish", re.compile(r"\b(?:suj|sooj|sujh|phool) (?:gaya|gayi|gya|gyi|gaye|raha|rahi)\b")),
+    ("trauma", "hinglish", re.compile(r"\b(?:daant|dant|daat|daanth)\b.{0,20}\b(?:toot|tut|tuut|hil|gir) ?(?:gaya|gya|gaye|gye|gayi|raha|rha)\b")),
+    ("trauma", "hinglish", re.compile(r"\bchot (?:lag|lagi|aayi|aai)\b")),
+    ("trauma", "hinglish", re.compile(r"\b(?:accident|gir gaya|gir gayi|gir gya|gira)\b.{0,40}\b(?:daant|dant|muh|munh|mooh|jabda)\b")),
+    # --- Hindi (Devanagari) -------------------------------------------------
+    (
+        "pain",
+        "hi",
+        _compile_substrings(
+            [
+                "बहुत दर्द", "तेज दर्द", "तेज़ दर्द", "असहनीय दर्द", "दर्द हो रहा", "दर्द हो रही", "दर्द है", "दर्द से",
+                "दांत में दर्द", "दाँत में दर्द", "दाढ़ में दर्द", "मसूड़े में दर्द", "दुख रहा", "दुख रही",
+            ]
+        ),
+    ),
+    (
+        "bleeding",
+        "hi",
+        _compile_substrings(["खून आ रहा", "खून निकल रहा", "खून बह रहा", "खून बंद नहीं", "खून रुक नहीं", "बहुत खून", "ब्लीडिंग"]),
+    ),
+    ("swelling", "hi", _compile_substrings(["सूजन", "सूज गया", "सूज गई", "सूज गयी", "फूल गया", "फूल गई", "मवाद"])),
+    (
+        "trauma",
+        "hi",
+        _compile_substrings(
+            ["दांत टूट", "दाँत टूट", "टूट गया", "टूट गई", "टूट गयी", "चोट", "गिर गया", "गिर गई", "गिर गयी", "दांत हिल", "दाँत हिल", "एक्सीडेंट"]
+        ),
+    ),
+)
+
+
+class EmergencyResult(BaseModel):
+    """Whether the patient reports a possible dental emergency.
+
+    ``reason_codes`` are symptom categories (``pain``, ``bleeding``,
+    ``swelling``, ``trauma``), never the patient's words. ``language`` is the
+    patient's language/script, used to pick the deterministic reply.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    sku: str = Field(..., min_length=1, max_length=64)
+    detected: bool = False
+    hit_count: int = Field(0, ge=0)
+    reason_codes: List[str] = Field(default_factory=list)
+    language: PatientLanguage = "en"
+
+
+class EmergencyDetector:
+    """Flags pain, bleeding, swelling or dental trauma in English, Hindi and Hinglish.
+
+    Deterministic and offline. Deliberately biased towards escalating: a
+    false positive costs a staff callback, a false negative leaves a patient
+    in pain talking to a bot.
+    """
+
+    def detect(self, text: Any) -> EmergencyResult:
+        normalized = normalize_text(text)
+        if not normalized:
+            return EmergencyResult()
+
+        reason_codes: Set[str] = set()
+        scripts: Set[str] = set()
+        hits = 0
+        for code, script, pattern in _EMERGENCY_PATTERNS:
+            if pattern.search(normalized):
+                hits += 1
+                reason_codes.add(code)
+                scripts.add(script)
+                if hits >= MAX_PATTERN_HITS:
+                    break
+
+        language = detect_language(normalized)
+        if language == "en" and "hinglish" in scripts:
+            language = "hinglish"
+        return EmergencyResult(
+            detected=bool(reason_codes),
+            hit_count=hits,
+            reason_codes=_sorted_unique(reason_codes),
+            language=language,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. Grounding validation
+# ---------------------------------------------------------------------------
+
+
+_PARENTHETICAL_RE = re.compile(r"\(([^)]{0,60})\)")
+
+
+class ServiceFact(BaseModel):
+    """A clinic service and its price range, treated as ground truth.
+
+    ``None`` prices mean "unknown", which is not the same as "any price": a
+    price claim about a service with an unknown range is unverifiable.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=64)
     name: str = Field(..., min_length=1, max_length=120)
-    price_inr: Optional[float] = Field(None, ge=0)
-    in_stock: Optional[bool] = None
-    origin: Optional[str] = Field(None, max_length=120)
-    tasting_notes: Optional[List[str]] = None
+    aliases: List[str] = Field(default_factory=list, description="Normalized match terms, longest first")
+    price_min_inr: Optional[float] = Field(None, ge=0)
+    price_max_inr: Optional[float] = Field(None, ge=0)
 
     @classmethod
-    def from_product(cls, product: Product) -> "ProductFact":
+    def from_service(cls, service: Service) -> "ServiceFact":
         return cls(
-            sku=product.sku,
-            name=product.name,
-            price_inr=product.price_inr,
-            in_stock=product.in_stock,
-            origin=product.origin,
-            tasting_notes=list(product.tasting_notes),
+            id=service.id,
+            name=service.name,
+            aliases=service.match_aliases(),
+            price_min_inr=service.price_min_inr,
+            price_max_inr=service.price_max_inr,
         )
 
     @classmethod
-    def from_tool_item(cls, item: Mapping[str, Any]) -> Optional["ProductFact"]:
-        """A ``ProductResult``-shaped dict -> fact; ``None`` if it is malformed."""
-        sku, name = item.get("sku"), item.get("name")
-        if not isinstance(sku, str) or not isinstance(name, str) or not sku or not name:
+    def from_tool_item(cls, item: Mapping[str, Any]) -> Optional["ServiceFact"]:
+        """A ``ClinicFact`` dict of kind ``service`` -> fact; ``None`` otherwise."""
+        if item.get("kind") != "service":
             return None
-        price = item.get("price_inr")
-        in_stock = item.get("in_stock")
-        origin = item.get("origin")
-        notes = item.get("tasting_notes")
+        fact_id, title = item.get("id"), item.get("title")
+        if not isinstance(fact_id, str) or not isinstance(title, str) or not fact_id or not title:
+            return None
+
+        def price(key: str) -> Optional[float]:
+            value = item.get(key)
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+        title = title[:120]
+        # "Root canal treatment (RCT)" -> the full title, "root canal treatment" and "rct".
+        terms = {title, _PARENTHETICAL_RE.sub(" ", title), *_PARENTHETICAL_RE.findall(title)}
+        aliases = sorted({a for a in (normalize_match_text(t) for t in terms) if a}, key=lambda t: (-len(t), t))
         try:
             return cls(
-                sku=sku[:64],
-                name=name[:120],
-                price_inr=float(price) if isinstance(price, (int, float)) and not isinstance(price, bool) else None,
-                in_stock=in_stock if isinstance(in_stock, bool) else None,
-                origin=origin[:120] if isinstance(origin, str) else None,
-                tasting_notes=[str(n)[:60] for n in notes[:20]] if isinstance(notes, list) else None,
+                id=fact_id[:64],
+                name=title,
+                aliases=aliases,
+                price_min_inr=price("price_min_inr"),
+                price_max_inr=price("price_max_inr"),
             )
         except ValueError:
             return None
 
-    def merged_with(self, other: "ProductFact") -> "ProductFact":
-        """Fill this fact's unknown attributes from ``other`` (same SKU)."""
+    def merged_with(self, other: "ServiceFact") -> "ServiceFact":
+        """Fill unknown prices and add aliases from ``other`` (same ID)."""
+        aliases = sorted(set(self.aliases) | set(other.aliases), key=lambda t: (-len(t), t))
         return self.model_copy(
             update={
-                "price_inr": self.price_inr if self.price_inr is not None else other.price_inr,
-                "in_stock": self.in_stock if self.in_stock is not None else other.in_stock,
-                "origin": self.origin if self.origin is not None else other.origin,
-                "tasting_notes": self.tasting_notes if self.tasting_notes is not None else other.tasting_notes,
+                "aliases": aliases,
+                "price_min_inr": self.price_min_inr if self.price_min_inr is not None else other.price_min_inr,
+                "price_max_inr": self.price_max_inr if self.price_max_inr is not None else other.price_max_inr,
             }
         )
 
+    def allows(self, amount: float) -> Optional[bool]:
+        """Whether ``amount`` is inside this service's range; ``None`` if unknown."""
+        if self.price_min_inr is None or self.price_max_inr is None:
+            return None
+        return self.price_min_inr <= amount <= self.price_max_inr
+
 
 class GroundingResult(BaseModel):
-    """Whether a model reply's product claims are supported by known facts."""
+    """Whether a model reply's clinic claims are supported by known facts."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     grounded: bool = True
     violations: List[str] = Field(default_factory=list)
-    matched_products: List[str] = Field(default_factory=list, description="SKUs mentioned in the reply")
+    matched_services: List[str] = Field(default_factory=list, description="Service IDs mentioned in the reply")
     reason_codes: List[str] = Field(default_factory=list)
     facts_available: bool = False
     claims_checked: int = Field(0, ge=0)
 
 
+_CURRENCY = r"(?:₹|rs\.?|inr|rupees?|rupaye|rupaiye|रुपये|रुपए|रु\.?)"
+_CURRENCY_AFTER = r"(?:inr|rupees?|rs\.?|rupaye|rupaiye|रुपये|रुपए|रु)"
+_AMOUNT = r"(\d[\d,]{0,12}(?:\.\d{1,2})?)"
 _PRICE_RE = re.compile(
-    r"(?:₹|rs\.?|inr)\s*(\d[\d,]{0,12}(?:\.\d{1,2})?)|(\d[\d,]{0,12}(?:\.\d{1,2})?)\s*(?:inr|rupees|rs\.?)(?![a-z])",
+    rf"{_CURRENCY}\s*{_AMOUNT}|{_AMOUNT}\s*{_CURRENCY_AFTER}(?![a-z])",
     re.IGNORECASE,
 )
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-_OUT_OF_STOCK_RE = re.compile(
-    r"\b(out of stock|sold out|unavailable|not available|not in stock|currently out|no longer (?:available|stocked))\b"
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?।])\s+|\n+")
+# Roman-script mentions only: a Devanagari transliteration cannot be compared
+# against the English names on file, so it is not checked.
+_DENTIST_MENTION_RE = re.compile(r"\bdr\.?\s+([a-z][a-z'-]{1,30})")
+# Medicines, doses and home remedies. The assistant must never suggest these;
+# naming them at all in a reply is treated as unverified medical advice.
+_MEDICAL_ADVICE_RE = re.compile(
+    r"\b(?:paracetamol|acetaminophen|ibuprofen|aspirin|diclofenac|nimesulide|amoxicillin|augmentin|"
+    r"metronidazole|azithromycin|combiflam|dolo|crocin|calpol|antibiotics?|painkillers?|pain killers?|"
+    r"analgesics?|clove oil|salt water rinse|warm salt water|\d+\s?mg)\b"
+    r"|पैरासिटामोल|एंटीबायोटिक|पेनकिलर|दर्द की गोली|दर्द निवारक"
 )
-_IN_STOCK_RE = re.compile(
-    r"\b(in stock|available now|currently available|is available|are available|available today|"
-    r"we have (?:it|them|this|these) (?:in stock|available)|ready to ship)\b"
-)
-_ORIGIN_CUE_RE = re.compile(
-    r"\b(from|grown|sourced|origin|originat\w*|estate|farm\w*|region|beans?|coffee|single origin)\b"
-)
-_TASTING_CUE_RE = re.compile(
-    r"\b(notes?|tasting|flavou?rs?|hints?|tastes?|profile|palate|aroma|finish|acidity|sweetness|body)\b"
-)
-# The unknown-product check looks at the *original-case* reply for a proper-noun
-# product-ish phrase ("our Midnight Roast") and checks it against known aliases.
-_PRODUCT_PHRASE_RE = re.compile(
-    r"\b(?:our|the)\s+((?:[A-Z][\w'-]{1,30}\s+){1,3}"
-    r"(?:Blend|Roast|Reserve|Espresso|Decaf|Subscription|Grinder|Dripper|Scale|Filters?|Beans|Coffee))\b"
-)
-
-_COMMON_ORIGINS: FrozenSet[str] = frozenset(
-    {
-        "ethiopia", "yirgacheffe", "sidamo", "guji", "harrar", "kenya", "kirinyaga", "nyeri",
-        "colombia", "huila", "narino", "brazil", "india", "coorg", "chikmagalur", "araku",
-        "guatemala", "antigua", "jamaica", "blue mountain", "hawaii", "kona", "vietnam",
-        "indonesia", "sumatra", "java", "sulawesi", "bali", "yemen", "rwanda", "burundi",
-        "tanzania", "uganda", "peru", "honduras", "costa rica", "panama", "nicaragua",
-        "el salvador", "mexico", "papua new guinea", "bolivia", "ecuador", "nepal", "thailand",
-    }
-)
-_COMMON_TASTING_TERMS: FrozenSet[str] = frozenset(
-    {
-        "chocolate", "dark chocolate", "milk chocolate", "cocoa", "caramel", "toffee", "butterscotch",
-        "citrus", "lemon", "lime", "orange", "grapefruit", "bergamot", "floral", "jasmine", "rose",
-        "berry", "berries", "blueberry", "strawberry", "raspberry", "cherry", "black currant",
-        "blackcurrant", "stone fruit", "apricot", "peach", "plum", "nutty", "hazelnut", "almond",
-        "walnut", "peanut", "honey", "vanilla", "molasses", "brown sugar", "maple", "tobacco",
-        "smoky", "smoke", "earthy", "spice", "spicy", "cinnamon", "clove", "winey", "wine",
-        "tropical", "mango", "pineapple", "papaya", "apple", "grape", "malt", "malty", "cereal",
-        "biscuit", "cream", "creamy", "buttery", "herbal", "tea-like", "black tea", "green apple",
-    }
-)
-_ORIGIN_GENERIC_TOKENS: FrozenSet[str] = frozenset({"rotating", "single", "origins", "origin", "and", "the"})
-
-
-def _product_aliases(name: str) -> List[str]:
-    """Normalized name plus short, distinctive prefixes for loose matching."""
-    base = re.sub(r"\([^)]{0,60}\)", " ", name)
-    normalized = _strip_punctuation(normalize_text(base))
-    tokens = normalized.split()
-    aliases = [normalized] if normalized else []
-    if len(tokens) >= 2:
-        aliases.append(" ".join(tokens[:2]))
-    if tokens and len(tokens[0]) >= 7:
-        aliases.append(tokens[0])
-    return [a for a in aliases if a]
-
-
-def _term_regex(terms: Iterable[str]) -> Optional["re.Pattern[str]"]:
-    ordered = sorted({t for t in terms if t}, key=lambda t: (-len(t), t))
-    if not ordered:
-        return None
-    return re.compile(r"\b(" + "|".join(re.escape(t) for t in ordered) + r")\b")
 
 
 def _parse_amount(raw: str) -> Optional[float]:
@@ -687,23 +842,18 @@ def _format_amount(value: float) -> str:
 class GroundingValidator:
     """Conservative, deterministic claim checker for outgoing replies.
 
-    Facts come from (in order of authority) explicit ``facts``, the
-    current-turn ``tool_results`` (``product_lookup`` results *and*
-    suggestions), and — only to enrich those by SKU with origin/tasting
-    notes, and to whitelist business amounts such as a free-shipping
-    threshold — an optional ``KnowledgeBase``. With ``catalog_as_facts=True``
-    every catalog product counts as a fact, for deployments whose prompt
-    exposes the whole catalog.
+    Service facts come from explicit ``facts``, the current-turn
+    ``tool_results`` (``clinic_faq_lookup`` results *and* suggestions), and
+    the ``KnowledgeBase`` (every clinic service is trusted data). Checks:
 
-    It checks, sentence by sentence: prices, availability, origins and
-    tasting notes stated about a product the reply names; unknown
-    product-like names; and any price stated when no product facts exist.
-    An attribute the facts do not carry is reported as unverifiable rather
-    than approved. No LLM, no network.
+    - every rupee amount must fall inside the range of the service(s) the
+      sentence names, or of some known service if the sentence names none;
+    - a price with no service facts at all is unverifiable;
+    - any "Dr. <name>" must be one of the clinic's dentists (when known);
+    - medicine names, doses and home remedies are never allowed.
+
+    No LLM, no network.
     """
-
-    def __init__(self, catalog_as_facts: bool = False):
-        self._catalog_as_facts = catalog_as_facts
 
     # -- Fact collection ----------------------------------------------------
 
@@ -711,14 +861,14 @@ class GroundingValidator:
         self,
         tool_results: Sequence[Union[ToolInvocation, Mapping[str, Any]]] = (),
         knowledge: Optional[KnowledgeBase] = None,
-        facts: Sequence[ProductFact] = (),
-    ) -> List[ProductFact]:
-        by_sku: Dict[str, ProductFact] = {}
+        facts: Sequence[ServiceFact] = (),
+    ) -> List[ServiceFact]:
+        by_id: Dict[str, ServiceFact] = {}
 
-        def add(fact: Optional[ProductFact]) -> None:
-            if fact is None or len(by_sku) >= MAX_FACTS and fact.sku not in by_sku:
+        def add(fact: Optional[ServiceFact]) -> None:
+            if fact is None or len(by_id) >= MAX_FACTS and fact.id not in by_id:
                 return
-            by_sku[fact.sku] = fact.merged_with(by_sku[fact.sku]) if fact.sku in by_sku else fact
+            by_id[fact.id] = fact.merged_with(by_id[fact.id]) if fact.id in by_id else fact
 
         for fact in facts:
             add(fact)
@@ -732,19 +882,34 @@ class GroundingValidator:
                     continue
                 for item in items[:MAX_FACTS]:
                     if isinstance(item, Mapping):
-                        add(ProductFact.from_tool_item(item))
+                        add(ServiceFact.from_tool_item(item))
         if knowledge is not None:
-            for product in knowledge.catalog.products:
-                if self._catalog_as_facts or product.sku in by_sku:
-                    add(ProductFact.from_product(product))
-        return list(by_sku.values())
+            for service in knowledge.clinic.services:
+                add(ServiceFact.from_service(service))
+        return list(by_id.values())
 
     @staticmethod
-    def business_amounts(knowledge: Optional[KnowledgeBase]) -> Set[float]:
-        """Currency amounts stated in the business digest (e.g. a shipping threshold)."""
-        if knowledge is None:
-            return set()
-        return set(_amounts_in(build_business_digest(knowledge)))
+    def _dentist_name_terms(
+        tool_results: Sequence[Union[ToolInvocation, Mapping[str, Any]]], knowledge: Optional[KnowledgeBase]
+    ) -> Optional[Set[str]]:
+        """Normalized first/last names of known dentists, or ``None`` if none are known."""
+        names: List[str] = []
+        if knowledge is not None:
+            names.extend(d.name for d in knowledge.clinic.dentists)
+        for invocation in tool_results:
+            result = invocation.result if isinstance(invocation, ToolInvocation) else invocation
+            if isinstance(result, Mapping) and isinstance(result.get("results"), list):
+                names.extend(
+                    item["title"]
+                    for item in result["results"]
+                    if isinstance(item, Mapping) and item.get("kind") == "dentist" and isinstance(item.get("title"), str)
+                )
+        if not names:
+            return None
+        terms: Set[str] = set()
+        for name in names:
+            terms.update(normalize_match_text(name).split()[1:])  # drop the "dr" prefix
+        return terms
 
     # -- Validation ---------------------------------------------------------
 
@@ -753,7 +918,7 @@ class GroundingValidator:
         response_text: Any,
         tool_results: Sequence[Union[ToolInvocation, Mapping[str, Any]]] = (),
         knowledge: Optional[KnowledgeBase] = None,
-        facts: Sequence[ProductFact] = (),
+        facts: Sequence[ServiceFact] = (),
     ) -> GroundingResult:
         raw = response_text[:MAX_ANALYSIS_LENGTH] if isinstance(response_text, str) else ""
         normalized = normalize_text(raw)
@@ -761,128 +926,59 @@ class GroundingValidator:
             return GroundingResult(reason_codes=["empty_response"])
 
         known = self.collect_facts(tool_results, knowledge, facts)
-        allowed_amounts = self.business_amounts(knowledge)
         violations: List[str] = []
-        matched_skus: List[str] = []
         claims = 0
-
-        aliases: List[Tuple[str, ProductFact]] = [(alias, fact) for fact in known for alias in _product_aliases(fact.name)]
-        alias_regex = _term_regex(alias for alias, _ in aliases)
-        origin_terms = set(_COMMON_ORIGINS)
-        tasting_terms = set(_COMMON_TASTING_TERMS)
-        for fact in known:
-            if fact.origin:
-                origin_terms.update(
-                    t for t in _strip_punctuation(normalize_text(fact.origin)).split()
-                    if len(t) >= 4 and t not in _ORIGIN_GENERIC_TOKENS
-                )
-            for note in fact.tasting_notes or []:
-                tasting_terms.add(_strip_punctuation(normalize_text(note)))
-        origin_regex = _term_regex(origin_terms)
-        tasting_regex = _term_regex(tasting_terms)
 
         def add_violation(code: str) -> None:
             if code not in violations and len(violations) < MAX_VIOLATIONS:
                 violations.append(code)
 
-        def products_in(sentence: str) -> List[ProductFact]:
-            if alias_regex is None:
-                return []
-            found: Dict[str, ProductFact] = {}
-            for match in alias_regex.finditer(sentence):
-                for alias, fact in aliases:
-                    if alias == match.group(1):
-                        found.setdefault(fact.sku, fact)
-            return list(found.values())
-
-        def without_names(sentence: str) -> str:
-            return alias_regex.sub(" ", sentence) if alias_regex is not None else sentence
+        def services_in(sentence: str) -> List[ServiceFact]:
+            padded = f" {normalize_match_text(sentence)} "
+            # A trailing "s" covers plurals ("root canals", "check ups").
+            return [f for f in known if any(f" {a} " in padded or f" {a}s " in padded for a in f.aliases)]
 
         sentences = [s for s in _SENTENCE_SPLIT_RE.split(normalized) if s.strip()][:MAX_SENTENCES]
-        all_matched: Dict[str, ProductFact] = {}
+        all_matched: Dict[str, ServiceFact] = {}
         for sentence in sentences:
-            for fact in products_in(sentence):
-                all_matched.setdefault(fact.sku, fact)
-        matched_skus = list(all_matched)
+            for fact in services_in(sentence):
+                all_matched.setdefault(fact.id, fact)
 
+        # Prices ------------------------------------------------------------
         for sentence in sentences:
-            in_sentence = products_in(sentence)
-            focus = in_sentence or list(all_matched.values())
-            body = without_names(sentence)
-
-            # Prices --------------------------------------------------------
+            focus = services_in(sentence) or list(all_matched.values())
             for amount in _amounts_in(sentence):
                 claims += 1
-                if amount in allowed_amounts:
-                    continue
                 if not known:
                     add_violation(f"price_without_facts:{_format_amount(amount)}")
                     continue
-                candidates = focus or known
-                if not any(f.price_inr == amount for f in candidates):
+                verdicts = [f.allows(amount) for f in (focus or known)]
+                if any(v is True for v in verdicts):
+                    continue
+                if all(v is None for v in verdicts):
+                    add_violation(f"unverifiable_price:{_format_amount(amount)}")
+                else:
                     add_violation(f"unsupported_price:{_format_amount(amount)}")
 
-            # Availability ----------------------------------------------------
-            # A follow-on sentence ("It is out of stock.") is attributed to
-            # the reply's product only when exactly one product was named.
-            says_out = bool(_OUT_OF_STOCK_RE.search(body))
-            says_in = bool(_IN_STOCK_RE.search(body))
-            availability_targets = in_sentence or (list(all_matched.values()) if len(all_matched) == 1 else [])
-            if says_out or says_in:
-                for fact in availability_targets:
-                    claims += 1
-                    if fact.in_stock is None:
-                        add_violation(f"unverifiable_availability:{fact.sku}")
-                    elif (says_out and fact.in_stock) or (says_in and not fact.in_stock and not says_out):
-                        add_violation(f"unsupported_availability:{fact.sku}")
-
-            if not in_sentence:
-                # Origin terms with a cue but no product context: grounded only
-                # if some known product actually has that origin.
-                if known and origin_regex is not None and _ORIGIN_CUE_RE.search(body):
-                    for match in origin_regex.finditer(body):
-                        term = match.group(1)
-                        claims += 1
-                        if not any(f.origin and term in normalize_text(f.origin) for f in known):
-                            add_violation(f"unsupported_origin:{term}")
-                continue
-
-            # Origin ----------------------------------------------------------
-            if origin_regex is not None:
-                for match in origin_regex.finditer(body):
-                    term = match.group(1)
-                    claims += 1
-                    if any(f.origin is None for f in in_sentence):
-                        add_violation(f"unverifiable_origin:{in_sentence[0].sku}")
-                    elif not any(term in normalize_text(f.origin or "") for f in in_sentence):
-                        add_violation(f"unsupported_origin:{term}")
-
-            # Tasting notes ---------------------------------------------------
-            if tasting_regex is not None:
-                terms = [m.group(1) for m in tasting_regex.finditer(body)][:MAX_VIOLATIONS]
-                if terms and (_TASTING_CUE_RE.search(body) or len(terms) >= 2):
-                    for term in terms:
-                        claims += 1
-                        if any(f.tasting_notes is None for f in in_sentence):
-                            add_violation(f"unverifiable_tasting_note:{in_sentence[0].sku}")
-                        elif not any(
-                            term in {normalize_text(n) for n in (f.tasting_notes or [])} for f in in_sentence
-                        ):
-                            add_violation(f"unsupported_tasting_note:{term}")
-
-        # Unknown product-like names (original case) ----------------------------
-        if known:
-            for match in _PRODUCT_PHRASE_RE.finditer(raw):
-                phrase = _strip_punctuation(normalize_text(match.group(1)))
+        # Dentists ----------------------------------------------------------
+        dentist_terms = self._dentist_name_terms(tool_results, knowledge)
+        if dentist_terms is not None:
+            for match in _DENTIST_MENTION_RE.finditer(normalized):
                 claims += 1
-                if alias_regex is None or not alias_regex.search(phrase):
-                    add_violation("unknown_product_name")
+                mentioned = normalize_match_text(match.group(1))
+                if mentioned and mentioned.split()[0] not in dentist_terms:
+                    add_violation("unknown_dentist")
+
+        # Medical advice ----------------------------------------------------
+        if _MEDICAL_ADVICE_RE.search(normalized):
+            claims += 1
+            add_violation("medical_advice")
 
         reason_codes = _sorted_unique(v.split(":", 1)[0] for v in violations)
         return GroundingResult(
             grounded=not violations,
             violations=violations,
-            matched_products=matched_skus,
+            matched_services=list(all_matched),
             reason_codes=reason_codes,
             facts_available=bool(known),
             claims_checked=claims,
@@ -906,6 +1002,7 @@ class GuardrailSignals(BaseModel):
     anger: Optional[AngerResult] = None
     repetition: Optional[RepetitionResult] = None
     human_request: Optional[HumanRequestResult] = None
+    emergency: Optional[EmergencyResult] = None
     grounding: Optional[GroundingResult] = None
 
     def with_grounding(self, grounding: GroundingResult) -> "GuardrailSignals":
@@ -919,6 +1016,7 @@ def analyze_customer_message(
     anger: Optional[AngerScorer] = None,
     repetition: Optional[RepetitionDetector] = None,
     human_request: Optional[HumanRequestDetector] = None,
+    emergency: Optional[EmergencyDetector] = None,
 ) -> GuardrailSignals:
     """Run the input-side detectors on one customer message (no grounding yet)."""
     return GuardrailSignals(
@@ -926,6 +1024,7 @@ def analyze_customer_message(
         anger=(anger or AngerScorer()).score(text),
         repetition=(repetition or RepetitionDetector()).detect(text, history),
         human_request=(human_request or HumanRequestDetector()).detect(text),
+        emergency=(emergency or EmergencyDetector()).detect(text),
     )
 
 
@@ -960,6 +1059,8 @@ __all__ = [
     "ANGER_DECAY",
     "AngerResult",
     "AngerScorer",
+    "EmergencyDetector",
+    "EmergencyResult",
     "GroundingResult",
     "GroundingValidator",
     "GuardrailSignals",
@@ -970,11 +1071,13 @@ __all__ = [
     "InjectionResult",
     "MAX_ANALYSIS_LENGTH",
     "MAX_HISTORY_TURNS_COMPARED",
-    "ProductFact",
+    "PatientLanguage",
     "REPETITION_SIMILARITY_THRESHOLD",
     "RepetitionDetector",
     "RepetitionResult",
+    "ServiceFact",
     "analyze_customer_message",
     "apply_signals_to_flags",
+    "detect_language",
     "normalize_text",
 ]

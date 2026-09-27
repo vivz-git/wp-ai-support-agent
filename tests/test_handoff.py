@@ -56,16 +56,10 @@ SENDER = "919876543210"
 OTHER_SENDER = "919812345678"
 SECRET = "sk-handoff-secret-9f8e7d6c"
 
-WHOLESALE_DELTA = LeadDelta(
-    track="wholesale",
-    contact_name="Asha Rao",
-    business_name="Third Wave Cafe",
-    business_type="cafe",
-    monthly_volume_kg=25,
-    city="Bengaluru",
-    timeline="within_1_month",
-    email="Asha@ThirdWave.example",
-    intent_summary="Wants a monthly espresso blend supply for two cafe outlets",
+BOOKING_DELTA = LeadDelta(
+    patient_name="Asha Rao",
+    concern="teeth cleaning",
+    preferred_day_time="Saturday 11am",
 )
 
 FIXED_NOW = datetime(2026, 9, 11, 10, 0, 0, tzinfo=timezone.utc)
@@ -86,22 +80,22 @@ def _state(sender: str = SENDER, turns: int = 1) -> ConversationState:
 def _conversation(sender: str = SENDER) -> ConversationState:
     """A short realistic conversation with lead data and a tool call."""
     state = _state(sender)
-    state.add_user_message("Hi, do you supply cafes? We need about 25kg a month in Bengaluru.")
-    state.set_intent(Intent.WHOLESALE_INQUIRY, 0.9)
+    state.add_user_message("Hi, how much is a teeth cleaning? I'd like to come in on Saturday.")
+    state.set_intent(Intent.BOOKING, 0.9)
     state.record_tool_invocation(
         ToolInvocation(
             tool_name="lookup_product",
             turn=1,
             status="ok",
             ok=True,
-            arguments={"query": "espresso"},
-            result={"internal_sku": "ESP-INTERNAL-42", "price_inr": 850},
+            arguments={"query": "rct"},
+            result={"internal_id": "SVC-INTERNAL-42", "price_min_inr": 800},
         )
     )
-    state.add_assistant_message("Yes, we do wholesale. Could I get your business name and a timeline?")
+    state.add_assistant_message("Cleaning is ₹800–₹1,500. May I have the patient's name for the booking?")
     state.begin_turn()
-    state.add_user_message("Third Wave Cafe, within a month. I'm Asha. Can I talk to a human?")
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.add_user_message("I'm Asha Rao, Saturday 11am. Can I talk to a human?")
+    state.apply_lead_delta(BOOKING_DELTA)
     return state
 
 
@@ -195,7 +189,7 @@ def test_request_serialization_round_trip():
     assert restored == request
     assert payload["kind"] == "escalation"
     assert payload["priority"] == "high"
-    assert payload["lead"]["business_name"] == "Third Wave Cafe"
+    assert payload["lead"]["concern"] == "teeth cleaning"
     assert payload["created_at"].startswith("2026-09-11T10:00:00")
 
 
@@ -207,15 +201,10 @@ def test_request_serialization_round_trip():
 def test_safe_lead_snapshot_contains_useful_fields_only():
     request = _request()
     lead = request.lead
-    assert lead.contact_name == "Asha Rao"
-    assert lead.business_name == "Third Wave Cafe"
-    assert lead.business_type == "cafe"
-    assert lead.city == "Bengaluru"
-    assert lead.email == "asha@thirdwave.example"
-    assert lead.lead_track == "wholesale"
-    assert lead.monthly_volume_kg == 25
-    assert lead.timeline == "within_1_month"
-    assert lead.intent_summary.startswith("Wants a monthly espresso")
+    assert lead.patient_name == "Asha Rao"
+    assert lead.concern == "teeth cleaning"
+    assert lead.preferred_day_time == "Saturday 11am"
+    assert lead.callback_phone == "********3210"  # WhatsApp number, masked
     assert lead.qualification == "qualified"
     assert lead.missing_required_fields == []
     dumped = lead.model_dump()
@@ -227,14 +216,14 @@ def test_no_full_phone_number_anywhere_in_request():
     state = _conversation()
     state.add_assistant_message(f"Thanks, I have your number as {SENDER}.")
     state.add_user_message(f"Yes {SENDER} is right, call me")
-    state.lead.intent_summary = f"Call back on {SENDER} about beans"
+    state.lead.concern = f"Call back on {SENDER} about cleaning"
     request = handoff_request_from_decision(_escalate(), state)
     dumped = request.model_dump_json()
     assert SENDER not in dumped
     assert "********3210" in dumped
     # The number was in the transcript and the lead text; both are masked, not dropped.
     assert any("********3210 is right" in entry.content for entry in request.transcript)
-    assert request.lead.intent_summary == "Call back on ********3210 about beans"
+    assert request.lead.concern == "Call back on ********3210 about cleaning"
 
 
 def test_no_credentials_in_request(monkeypatch):
@@ -324,7 +313,7 @@ def test_escalation_decision_produces_request():
     assert request is not None
     assert request.kind == HandoffKind.ESCALATION
     assert request.summary.startswith("Escalation for ********3210 after 2 turns (human_requested).")
-    assert "Wholesale lead: Asha Rao, Third Wave Cafe, cafe, Bengaluru." in request.summary
+    assert "Patient: Asha Rao. Concern: teeth cleaning. Preferred: Saturday 11am." in request.summary
 
 
 def test_handoff_ready_represented_safely():
@@ -335,7 +324,7 @@ def test_handoff_ready_represented_safely():
     assert request.kind == HandoffKind.QUALIFIED_LEAD
     assert request.priority == HandoffPriority.LOW
     assert request.lead.qualification == "qualified"
-    assert request.summary.startswith("Qualified lead for ********3210")
+    assert request.summary.startswith("Booking request for ********3210")
     # Consented: the state is handoff_ready and the code changes accordingly.
     state.mark_handoff_ready()
     consented = handoff_request_from_decision(_handoff_ready("handoff_ready"), state)
@@ -349,6 +338,8 @@ def test_handoff_ready_represented_safely():
     "codes, policy_priority, expected",
     [
         (["human_requested"], 3, HandoffPriority.HIGH),
+        (["dental_emergency"], 1, HandoffPriority.URGENT),
+        (["dental_emergency", "already_escalated"], 1, HandoffPriority.URGENT),
         (["high_anger_complaint"], 4, HandoffPriority.URGENT),
         (["repeated_unresolved"], 5, HandoffPriority.HIGH),
         (["injection_repeated", "injection_attempt"], 6, HandoffPriority.MEDIUM),
@@ -690,10 +681,10 @@ def test_empty_lead_handled():
     state.add_user_message("get me a person")
     request = handoff_request_from_decision(_escalate(), state)
     assert request.lead.is_empty()
-    assert request.lead.lead_track == "unknown"
     assert request.lead.qualification == "unknown"
-    assert request.lead.missing_required_fields == ["contact_name", "brew_method", "taste_preference"]
-    assert "Lead track: unknown; qualification: unknown." in request.summary
+    assert request.lead.missing_required_fields == ["patient_name", "concern", "preferred_day_time"]
+    assert request.lead.callback_phone == "********3210"
+    assert "No booking details yet; qualification: unknown." in request.summary
     assert SENDER not in request.model_dump_json()
 
 

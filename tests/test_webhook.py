@@ -51,24 +51,42 @@ def test_webhook_verification_failure_missing_parameters(client: TestClient):
     assert response.status_code == 403
 
 
-def test_valid_incoming_text_payload(client: TestClient, valid_text_payload, mock_wa, mock_llm):
-    """POST /webhook/whatsapp should parse text message, query LLM, and send WhatsApp reply."""
+def test_valid_incoming_text_payload(client: TestClient, valid_text_payload, mock_wa, mock_llm, test_drafts):
+    """POST /webhook/whatsapp should parse the text message, query the LLM, and queue
+    the reply as a pending draft for staff approval — never send it directly."""
     response = client.post("/webhook/whatsapp", json=valid_text_payload)
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "ok"
+    assert data["status"] == "pending_approval"
+    assert data["is_urgent"] is False
     assert "message_id" in data
 
-    # Verify WhatsApp client sent the reply
-    assert len(mock_wa.sent_messages) == 1
-    sent = mock_wa.sent_messages[0]
-    assert sent["to"] == "919876543210"
-    assert sent["body"] == mock_llm.response_text
+    # Nothing reaches the patient until a staff member approves it
+    assert mock_wa.sent_messages == []
+    pending = test_drafts.list_pending()
+    assert [d.id for d in pending] == [data["draft_id"]]
+    draft = pending[0]
+    assert draft.sender == "919876543210"
+    assert draft.patient_message == "Hello, I want to inquire about pricing."
+    assert draft.draft_text == mock_llm.response_text
+    assert draft.is_urgent is False
 
     # Verify LLM was called with the user's message
     assert len(mock_llm.calls) >= 1
     all_contents = [msg.content for call in mock_llm.calls for msg in call]
     assert any("Hello, I want to inquire about pricing." in content for content in all_contents)
+
+
+def test_approved_draft_is_sent_via_whatsapp(client: TestClient, valid_text_payload, mock_wa, mock_llm):
+    """Approving the queued draft on /staff is what delivers it."""
+    draft_id = client.post("/webhook/whatsapp", json=valid_text_payload).json()["draft_id"]
+
+    response = client.post(
+        f"/staff/drafts/{draft_id}/approve", data={"text": mock_llm.response_text}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert mock_wa.sent_messages == [{"to": "919876543210", "body": mock_llm.response_text}]
 
 
 def test_malformed_payload_missing_keys(client: TestClient):
@@ -130,12 +148,12 @@ def test_health_check(client: TestClient):
 
 
 def test_meta_sample_test_event_send_failure_handled_safely(
-    client: TestClient, meta_sample_test_payload, mock_llm
+    client: TestClient, meta_sample_test_payload, mock_llm, test_drafts
 ):
     """Meta's webhook dashboard 'Test' event has a synthetic sender that is not a
-    verified test recipient. Sending to it must fail gracefully with a 200 response
-    (not a 500 that triggers Meta retries), and the LLM should still run so the rest
-    of the pipeline (parse -> memory -> Groq) is proven to work end-to-end."""
+    verified test recipient. The webhook still runs the agent and queues a draft
+    (proving parse -> agent -> queue works end-to-end); approving that draft fails
+    gracefully and puts it back in the queue instead of erroring."""
     from app.main import app, get_whatsapp_client
 
     failing_wa_client = MockWhatsAppClient(raise_error_code=131030)
@@ -145,28 +163,30 @@ def test_meta_sample_test_event_send_failure_handled_safely(
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "send_failed"
-    assert "message_id" in data
-
-    # The LLM was still invoked (proves parse -> memory -> Groq worked)
+    assert data["status"] == "pending_approval"
     assert len(mock_llm.calls) >= 1
-    # No message was actually recorded as successfully sent
-    assert len(failing_wa_client.sent_messages) == 0
+
+    approve = client.post(
+        f"/staff/drafts/{data['draft_id']}/approve", data={"text": "Hello"}, follow_redirects=False
+    )
+    assert approve.status_code == 303
+    assert "notice=recipient_not_allowed" in approve.headers["location"]
+    assert failing_wa_client.sent_messages == []
+    assert [d.id for d in test_drafts.list_pending()] == [data["draft_id"]]
 
 
-def test_duplicate_webhook_delivery_does_not_send_twice(
-    client: TestClient, valid_text_payload, mock_wa, mock_llm
+def test_duplicate_webhook_delivery_does_not_queue_twice(
+    client: TestClient, valid_text_payload, mock_wa, mock_llm, test_drafts
 ):
     """A retried Meta webhook delivery (same message ID) must not trigger a second
-    LLM call or a second outbound WhatsApp reply."""
+    LLM call or a second draft."""
     first_response = client.post("/webhook/whatsapp", json=valid_text_payload)
     assert first_response.status_code == 200
-    assert first_response.json()["status"] == "ok"
+    assert first_response.json()["status"] == "pending_approval"
 
     initial_llm_calls = len(mock_llm.calls)
-    initial_wa_sends = len(mock_wa.sent_messages)
-    assert initial_wa_sends == 1
     assert initial_llm_calls >= 1
+    assert len(test_drafts.list_pending()) == 1
 
     # Meta redelivers the identical event (e.g. because the first response was slow
     # or a prior non-200 was returned)
@@ -174,17 +194,17 @@ def test_duplicate_webhook_delivery_does_not_send_twice(
     assert second_response.status_code == 200
     assert second_response.json()["status"] == "duplicate_ignored"
 
-    # LLM and WhatsApp send should each have been invoked exactly once, not twice
     assert len(mock_llm.calls) == initial_llm_calls
-    assert len(mock_wa.sent_messages) == initial_wa_sends
+    assert len(test_drafts.list_pending()) == 1
+    assert mock_wa.sent_messages == []
 
 
 def test_llm_failure_returns_200_with_safe_fallback(
-    client: TestClient, valid_text_payload, mock_wa
+    client: TestClient, valid_text_payload, mock_wa, test_drafts
 ):
     """If the LLM provider fails, the orchestrator produces a deterministic safe
     fallback reply, the webhook acknowledges with 200 (so Meta doesn't retry
-    and re-run), and the customer receives the safe fallback message."""
+    and re-run), and the fallback is queued for staff approval."""
     from app.agent.orchestrator import SAFE_FALLBACK_REPLY
     from app.main import app, get_llm_provider
 
@@ -194,19 +214,16 @@ def test_llm_failure_returns_200_with_safe_fallback(
     response = client.post("/webhook/whatsapp", json=valid_text_payload)
 
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "message_id" in data
-
-    assert len(mock_wa.sent_messages) == 1
-    assert mock_wa.sent_messages[0]["body"] == SAFE_FALLBACK_REPLY
+    assert response.json()["status"] == "pending_approval"
+    assert [d.draft_text for d in test_drafts.list_pending()] == [SAFE_FALLBACK_REPLY]
+    assert mock_wa.sent_messages == []
 
 
 def test_orchestrator_unexpected_failure_returns_200_agent_error(
-    client: TestClient, valid_text_payload, mock_wa
+    client: TestClient, valid_text_payload, mock_wa, test_drafts
 ):
     """If AgentOrchestrator.handle_turn raises unexpectedly, the webhook catches it,
-    logs safely, does not call WhatsApp send, and acknowledges with 200 agent_error."""
+    logs safely, queues nothing, and acknowledges with 200 agent_error."""
     from unittest.mock import AsyncMock
     from app.main import app, get_orchestrator
 
@@ -218,4 +235,22 @@ def test_orchestrator_unexpected_failure_returns_200_agent_error(
 
     assert response.status_code == 200
     assert response.json()["status"] == "agent_error"
-    assert len(mock_wa.sent_messages) == 0
+    assert mock_wa.sent_messages == []
+    assert test_drafts.list_pending() == []
+
+
+def test_queue_failure_returns_200_queue_error(client: TestClient, valid_text_payload, mock_wa):
+    """If the draft cannot be stored, the webhook still acknowledges with 200 and sends nothing."""
+    from app.main import app, get_draft_queue
+
+    class BrokenQueue:
+        def add(self, **kwargs):
+            raise RuntimeError("disk full")
+
+    app.dependency_overrides[get_draft_queue] = lambda: BrokenQueue()
+
+    response = client.post("/webhook/whatsapp", json=valid_text_payload)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queue_error"
+    assert mock_wa.sent_messages == []

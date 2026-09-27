@@ -1,217 +1,72 @@
-"""Business knowledge layer for the AI WhatsApp Support Agent.
+"""Clinic knowledge layer for the AI WhatsApp Support Agent.
 
-This module loads and validates the two publishable data files that describe
-the fictional business ("Kettle & Bloom Coffee Roasters") the agent supports:
+Loads and validates ``data/clinic_info.json``, which describes the fictional
+clinic ("SmileCare Dental") the agent supports: address, timings, phone,
+dentists, services with rough price ranges, and FAQs.
 
-- ``data/business.json``: hours, shipping/return policy, wholesale info, FAQs.
-- ``data/catalog.json``: the product catalog (single origins, blends, decaf,
-  equipment, subscriptions, accessories).
-
-Design constraints (Milestone 2, Slice 1):
-- No network calls. No LLM calls. No product-lookup tool. No agent logic.
+Design constraints:
+- No network calls. No LLM calls. No agent logic.
 - Explicit Pydantic models, not loose dictionaries.
 - Fails loudly (raises ``KnowledgeError``) on a missing or malformed file so a
   bad data file is caught at load time, not silently ignored at runtime.
-- Deterministic: loading the same files twice yields identical, immutable
+- Deterministic: loading the same file twice yields identical, immutable
   data and identical digest text.
 """
 
 import json
 import logging
-from enum import Enum
+import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
-# Default locations, relative to the project root (two levels up from this file).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_BUSINESS_PROFILE_PATH = _PROJECT_ROOT / "data" / "business.json"
-DEFAULT_CATALOG_PATH = _PROJECT_ROOT / "data" / "catalog.json"
+DEFAULT_CLINIC_INFO_PATH = _PROJECT_ROOT / "data" / "clinic_info.json"
+
+WEEKDAYS: Tuple[str, ...] = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+_ZERO_WIDTH_RE = re.compile("[​-‏⁠﻿]")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 class KnowledgeError(Exception):
-    """Raised when business/catalog knowledge data is missing or malformed.
+    """Raised when clinic knowledge data is missing or malformed."""
 
-    This is intentionally a single, clearly-named exception type so a caller
-    (or a startup check) can fail loudly with one obvious cause: the on-disk
-    knowledge data is not usable.
+
+def strip_punctuation(text: str) -> str:
+    """Replace punctuation and symbols with spaces and collapse whitespace.
+
+    Category-based rather than ``[^\\w\\s]``: Python's ``\\w`` does not match
+    Devanagari vowel signs, so a regex strip would break Hindi words apart.
     """
+    cleaned = "".join(" " if unicodedata.category(c)[0] in "PSC" and not c.isspace() else c for c in text)
+    return _WHITESPACE_RE.sub(" ", cleaned).strip()
+
+
+def normalize_match_text(text: str) -> str:
+    """NFKC, lower-cased, punctuation-free text used for alias/keyword matching."""
+    if not isinstance(text, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = _ZERO_WIDTH_RE.sub("", normalized)
+    return strip_punctuation(normalized.lower())
+
+
+def format_inr(amount: float) -> str:
+    return f"₹{amount:,.0f}"
 
 
 # ---------------------------------------------------------------------------
-# Catalog models
+# Models
 # ---------------------------------------------------------------------------
 
 
-class ProductCategory(str, Enum):
-    SINGLE_ORIGIN = "single_origin"
-    BLEND = "blend"
-    DECAF = "decaf"
-    EQUIPMENT = "equipment"
-    SUBSCRIPTION = "subscription"
-    ACCESSORY = "accessory"
-
-
-class RoastLevel(str, Enum):
-    LIGHT = "light"
-    MEDIUM = "medium"
-    MEDIUM_DARK = "medium_dark"
-    DARK = "dark"
-
-
-class BrewMethod(str, Enum):
-    ESPRESSO = "espresso"
-    FILTER = "filter"
-    POUROVER = "pourover"
-    FRENCHPRESS = "frenchpress"
-    MOKAPOT = "mokapot"
-    COLDBREW = "coldbrew"
-    AEROPRESS = "aeropress"
-
-
-class StockLevel(str, Enum):
-    NONE = "none"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-
-class ProductAttribute(str, Enum):
-    ORGANIC = "organic"
-    FAIRTRADE = "fairtrade"
-    SINGLE_ESTATE = "single_estate"
-    LOW_ACID = "low_acid"
-    HIGH_CAFFEINE = "high_caffeine"
-    DECAF = "decaf"
-    GIFT_READY = "gift_ready"
-
-# Categories that describe a roasted coffee (as opposed to equipment,
-# subscriptions, or accessories) and therefore must carry brew-relevant facts.
-_ROASTED_COFFEE_CATEGORIES = {
-    ProductCategory.SINGLE_ORIGIN,
-    ProductCategory.BLEND,
-    ProductCategory.DECAF,
-}
-
-
-class Product(BaseModel):
-    """A single catalog SKU.
-
-    Field set matches what the future ``product_lookup`` tool will need to
-    return, so no schema change should be required when that tool is built
-    in a later slice.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    sku: str = Field(..., pattern=r"^KB-[A-Z0-9]+(-[A-Z0-9]+)*$")
-    name: str = Field(..., min_length=1, max_length=120)
-    category: ProductCategory
-    origin: Optional[str] = Field(None, max_length=120)
-    process: Optional[str] = Field(None, max_length=120)
-    roast_level: Optional[RoastLevel] = None
-    tasting_notes: List[str] = Field(default_factory=list)
-    brew_methods: List[BrewMethod] = Field(default_factory=list)
-    price_inr: float = Field(..., gt=0, le=100000)
-    size_g: Optional[int] = Field(None, gt=0, le=20000)
-    in_stock: bool
-    stock_level: StockLevel
-    attributes: List[ProductAttribute] = Field(default_factory=list)
-    subscription_available: bool
-    wholesale_available: bool
-    dispatch_days: int = Field(..., ge=1, le=30)
-    product_url: str = Field(..., max_length=500)
-
-    @field_validator("tasting_notes")
-    @classmethod
-    def _validate_tasting_notes(cls, value: List[str]) -> List[str]:
-        for note in value:
-            if not note or not note.strip():
-                raise ValueError("tasting_notes entries must be non-empty strings")
-        return value
-
-    @field_validator("product_url")
-    @classmethod
-    def _validate_product_url(cls, value: str) -> str:
-        if not (value.startswith("https://") or value.startswith("http://")):
-            raise ValueError("product_url must be an http(s) URL")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_stock_consistency(self) -> "Product":
-        if not self.in_stock and self.stock_level != StockLevel.NONE:
-            raise ValueError(
-                f"{self.sku}: in_stock is False but stock_level is "
-                f"'{self.stock_level.value}' (expected 'none')"
-            )
-        if self.in_stock and self.stock_level == StockLevel.NONE:
-            raise ValueError(
-                f"{self.sku}: in_stock is True but stock_level is 'none'"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_roasted_coffee_fields(self) -> "Product":
-        if self.category in _ROASTED_COFFEE_CATEGORIES:
-            if not self.roast_level:
-                raise ValueError(
-                    f"{self.sku}: category '{self.category.value}' requires roast_level"
-                )
-            if not self.brew_methods:
-                raise ValueError(
-                    f"{self.sku}: category '{self.category.value}' requires at least one brew_method"
-                )
-        if self.category == ProductCategory.DECAF and ProductAttribute.DECAF not in self.attributes:
-            raise ValueError(f"{self.sku}: category 'decaf' requires the 'decaf' attribute")
-        return self
-
-
-class Catalog(BaseModel):
-    """The full validated product catalog."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    catalog_version: str = Field(..., min_length=1, max_length=40)
-    products: List[Product] = Field(..., min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_unique_skus(self) -> "Catalog":
-        skus = [p.sku for p in self.products]
-        duplicates = {sku for sku in skus if skus.count(sku) > 1}
-        if duplicates:
-            raise ValueError(f"Duplicate SKUs in catalog: {sorted(duplicates)}")
-        return self
-
-
-# ---------------------------------------------------------------------------
-# Business profile models
-# ---------------------------------------------------------------------------
-
-
-class BusinessLocation(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    roastery_address: str
-    city: str
-    state: str
-    country: str
-    serves_wholesale_locally: bool
-    ships_pan_india: bool
-
-
-class BusinessContact(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    whatsapp_support_hours: str
-    support_email: str
-    website: str
-
-
-class BusinessHours(BaseModel):
+class ClinicHours(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     day: str
@@ -219,58 +74,63 @@ class BusinessHours(BaseModel):
     close: Optional[str] = None
     closed: bool = False
 
+    @field_validator("day")
+    @classmethod
+    def _known_day(cls, value: str) -> str:
+        if value not in WEEKDAYS:
+            raise ValueError(f"unknown day '{value}'")
+        return value
+
     @model_validator(mode="after")
-    def _validate_hours_consistency(self) -> "BusinessHours":
+    def _validate_hours_consistency(self) -> "ClinicHours":
         if not self.closed and (not self.open or not self.close):
             raise ValueError(f"{self.day}: open/close required unless closed=true")
         return self
 
 
-class ShippingZone(BaseModel):
+class Dentist(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    zone: str
-    typical_delivery_days: str
+    id: str = Field(..., min_length=1, max_length=40)
+    name: str = Field(..., pattern=r"^Dr\. [A-Z][\w'-]+( [A-Z][\w'-]+)+$")
+    qualification: str = Field(..., min_length=1, max_length=80)
+    focus: str = Field(..., min_length=1, max_length=120)
 
 
-class ShippingPolicy(BaseModel):
+class Service(BaseModel):
+    """One clinic service with a rough price range in INR."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    summary: str
-    domestic_zones: List[ShippingZone]
-    shipping_fee_note: str
-    international_shipping: bool
+    id: str = Field(..., pattern=r"^svc-[a-z0-9]+(-[a-z0-9]+)*$")
+    name: str = Field(..., min_length=1, max_length=80)
+    aliases: List[str] = Field(..., min_length=1)
+    description: str = Field(..., min_length=1, max_length=300)
+    price_min_inr: float = Field(..., gt=0, le=500000)
+    price_max_inr: float = Field(..., gt=0, le=500000)
+    price_note: str = Field(..., min_length=1, max_length=200)
 
-
-class ReturnPolicy(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    summary: str
-    window_days: int = Field(..., ge=0, le=90)
-    conditions: List[str]
-    refund_or_replacement_handled_by: str
-
-
-class WholesaleInfo(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    summary: str
-    typical_minimum_order_kg: float = Field(..., ge=0)
-    customer_types: List[str]
-    process_note: str
-    pricing_disclosed_by_agent: bool
-
-    @field_validator("pricing_disclosed_by_agent")
+    @field_validator("aliases")
     @classmethod
-    def _agent_must_not_disclose_pricing(cls, value: bool) -> bool:
-        # This is a hard business rule, not just a default: the agent has no
-        # pricing authority, so this file must never flip it to True.
-        if value is not False:
-            raise ValueError(
-                "wholesale_info.pricing_disclosed_by_agent must be false — "
-                "the agent must never be configured to quote wholesale pricing"
-            )
+    def _aliases_not_blank(cls, value: List[str]) -> List[str]:
+        for alias in value:
+            if not normalize_match_text(alias):
+                raise ValueError("aliases must be non-empty after normalization")
         return value
+
+    @model_validator(mode="after")
+    def _range_ordered(self) -> "Service":
+        if self.price_min_inr > self.price_max_inr:
+            raise ValueError(f"{self.id}: price_min_inr must not exceed price_max_inr")
+        return self
+
+    def match_aliases(self) -> List[str]:
+        """Normalized name + aliases, longest first, deduplicated."""
+        terms = {normalize_match_text(self.name), *(normalize_match_text(a) for a in self.aliases)}
+        return sorted((t for t in terms if t), key=lambda t: (-len(t), t))
+
+    def price_range_text(self) -> str:
+        return f"{format_inr(self.price_min_inr)}–{format_inr(self.price_max_inr)}"
 
 
 class FAQItem(BaseModel):
@@ -279,10 +139,11 @@ class FAQItem(BaseModel):
     id: str
     question: str
     answer: str
+    keywords: List[str] = Field(default_factory=list)
 
 
-class BusinessProfile(BaseModel):
-    """Publishable facts about the business the agent may safely state."""
+class ClinicInfo(BaseModel):
+    """Publishable facts about the clinic the agent may safely state."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -290,15 +151,15 @@ class BusinessProfile(BaseModel):
     fictional_notice: str
     name: str
     short_name: str
-    founded_year: int = Field(..., ge=1900, le=2100)
     description: str
-    location: BusinessLocation
-    contact: BusinessContact
-    hours: List[BusinessHours]
-    shipping_policy: ShippingPolicy
-    return_policy: ReturnPolicy
-    wholesale_info: WholesaleInfo
-    supported_customer_types: List[str]
+    address: str
+    city: str
+    phone: str = Field(..., min_length=6, max_length=30)
+    email: str
+    hours: List[ClinicHours] = Field(..., min_length=7, max_length=7)
+    dentists: List[Dentist] = Field(..., min_length=1)
+    services: List[Service] = Field(..., min_length=1)
+    booking_note: str
     payment_methods_note: str
     faqs: List[FAQItem] = Field(..., min_length=1)
 
@@ -307,18 +168,33 @@ class BusinessProfile(BaseModel):
     def _must_be_marked_fictional(cls, value: bool) -> bool:
         if value is not True:
             raise ValueError(
-                "business.json must have is_fictional=true — this project must "
-                "never present a real business's data as a fictional demo"
+                "clinic_info.json must have is_fictional=true — this project must "
+                "never present a real clinic's data as a fictional demo"
             )
         return value
 
     @model_validator(mode="after")
-    def _validate_unique_faq_ids(self) -> "BusinessProfile":
-        ids = [f.id for f in self.faqs]
-        duplicates = {i for i in ids if ids.count(i) > 1}
-        if duplicates:
-            raise ValueError(f"Duplicate FAQ ids: {sorted(duplicates)}")
+    def _validate_unique_ids_and_days(self) -> "ClinicInfo":
+        for label, ids in (
+            ("service", [s.id for s in self.services]),
+            ("dentist", [d.id for d in self.dentists]),
+            ("FAQ", [f.id for f in self.faqs]),
+        ):
+            duplicates = {i for i in ids if ids.count(i) > 1}
+            if duplicates:
+                raise ValueError(f"Duplicate {label} ids: {sorted(duplicates)}")
+        if sorted(h.day for h in self.hours) != sorted(WEEKDAYS):
+            raise ValueError("hours must list each weekday exactly once")
         return self
+
+    def hours_summary(self) -> str:
+        """Deterministic one-line timings, grouping days with the same span."""
+        spans: dict = {}
+        for day in WEEKDAYS:
+            entry = next(h for h in self.hours if h.day == day)
+            span = "closed" if entry.closed else f"{entry.open}-{entry.close}"
+            spans.setdefault(span, []).append(day.capitalize())
+        return "; ".join(f"{', '.join(days)}: {span}" for span, days in spans.items())
 
 
 # ---------------------------------------------------------------------------
@@ -348,181 +224,76 @@ def _read_json_file(path: Path, label: str) -> dict:
     return data
 
 
-def load_business_profile(path: Optional[Path] = None) -> BusinessProfile:
-    """Load and validate the business profile from ``business.json``.
-
-    Args:
-        path: Optional override path (used by tests for fixture files).
-
-    Returns:
-        A validated, immutable ``BusinessProfile``.
+def load_clinic_info(path: Optional[Path] = None) -> ClinicInfo:
+    """Load and validate ``clinic_info.json``.
 
     Raises:
         KnowledgeError: If the file is missing, unreadable, not valid JSON,
             or fails schema validation.
     """
-    resolved_path = Path(path) if path is not None else DEFAULT_BUSINESS_PROFILE_PATH
-    data = _read_json_file(resolved_path, "Business profile")
+    resolved_path = Path(path) if path is not None else DEFAULT_CLINIC_INFO_PATH
+    data = _read_json_file(resolved_path, "Clinic info")
 
     try:
-        return BusinessProfile.model_validate(data)
+        return ClinicInfo.model_validate(data)
     except Exception as exc:
-        raise KnowledgeError(
-            f"Business profile at {resolved_path} failed validation: {exc}"
-        ) from exc
-
-
-def load_catalog(path: Optional[Path] = None) -> Catalog:
-    """Load and validate the product catalog from ``catalog.json``.
-
-    Args:
-        path: Optional override path (used by tests for fixture files).
-
-    Returns:
-        A validated, immutable ``Catalog``.
-
-    Raises:
-        KnowledgeError: If the file is missing, unreadable, not valid JSON,
-            or fails schema validation.
-    """
-    resolved_path = Path(path) if path is not None else DEFAULT_CATALOG_PATH
-    data = _read_json_file(resolved_path, "Catalog")
-
-    try:
-        return Catalog.model_validate(data)
-    except Exception as exc:
-        raise KnowledgeError(f"Catalog at {resolved_path} failed validation: {exc}") from exc
+        raise KnowledgeError(f"Clinic info at {resolved_path} failed validation: {exc}") from exc
 
 
 class KnowledgeBase(BaseModel):
-    """Immutable, validated bundle of business + catalog knowledge.
-
-    This is the object later slices (prompt builder, product-lookup tool)
-    are expected to consume. It performs no network or LLM calls; it is a
-    pure in-memory data container built once from validated JSON.
-    """
+    """Immutable, validated clinic knowledge consumed by prompts, tools and guardrails."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    business: BusinessProfile
-    catalog: Catalog
+    clinic: ClinicInfo
 
     @classmethod
-    def load(
-        cls,
-        business_path: Optional[Path] = None,
-        catalog_path: Optional[Path] = None,
-    ) -> "KnowledgeBase":
-        """Load both the business profile and catalog and bundle them.
-
-        Raises:
-            KnowledgeError: If either file is missing or fails validation.
-        """
-        business = load_business_profile(business_path)
-        catalog = load_catalog(catalog_path)
+    def load(cls, clinic_path: Optional[Path] = None) -> "KnowledgeBase":
+        clinic = load_clinic_info(clinic_path)
         logger.info(
-            "Loaded knowledge base: business=%s, catalog_version=%s, products=%d",
-            business.short_name,
-            catalog.catalog_version,
-            len(catalog.products),
+            "Loaded knowledge base: clinic=%s, services=%d, dentists=%d",
+            clinic.short_name,
+            len(clinic.services),
+            len(clinic.dentists),
         )
-        return cls(business=business, catalog=catalog)
+        return cls(clinic=clinic)
 
 
 @lru_cache()
 def get_knowledge_base() -> KnowledgeBase:
-    """Return a cached ``KnowledgeBase`` loaded from the default file paths.
-
-    Not wired into the running application in this slice. Provided for later
-    use by the prompt builder / orchestrator, and to give tests a single,
-    consistent entry point that mirrors ``app.config.get_settings``.
-    """
+    """Return a cached ``KnowledgeBase`` loaded from the default file path."""
     return KnowledgeBase.load()
 
 
 # ---------------------------------------------------------------------------
-# Digest builders
+# Digest
 # ---------------------------------------------------------------------------
 
 
 def build_business_digest(knowledge: KnowledgeBase) -> str:
-    """Build a compact, deterministic text digest of business facts.
+    """Compact, deterministic text digest of clinic facts for the system prompt.
 
-    Intended for a future prompt builder to embed directly into the system
-    prompt as grounding context. Output is plain text (no markdown tables,
-    consistent with the WhatsApp-appropriate style already used elsewhere in
-    this project), and is deterministic for a given ``KnowledgeBase``.
+    Service *prices* are deliberately left out: the model must fetch them
+    through ``clinic_faq_lookup`` so every quoted range comes from a tool
+    result the grounding validator can check against.
     """
-    b = knowledge.business
-    lines: List[str] = []
-
-    lines.append(f"Business: {b.name} ({b.short_name}), founded {b.founded_year}.")
-    lines.append(b.description)
-    lines.append(
-        f"Location: {b.location.roastery_address}. Ships pan-India: "
-        f"{'yes' if b.location.ships_pan_india else 'no'}."
-    )
-
-    hours_by_span: dict = {}
-    for h in b.hours:
-        span = "closed" if h.closed else f"{h.open}-{h.close}"
-        hours_by_span.setdefault(span, []).append(h.day)
-    hours_text = "; ".join(
-        f"{', '.join(days)}: {span}" for span, days in sorted(hours_by_span.items())
-    )
-    lines.append(f"Hours: {hours_text}")
-
-    lines.append(f"Shipping: {b.shipping_policy.summary} {b.shipping_policy.shipping_fee_note}")
-    for zone in b.shipping_policy.domestic_zones:
-        lines.append(f"  - {zone.zone}: {zone.typical_delivery_days} days")
-
-    lines.append(
-        f"Returns: {b.return_policy.summary} "
-        f"(window: {b.return_policy.window_days} days)"
-    )
-
-    lines.append(
-        f"Wholesale: {b.wholesale_info.summary} "
-        f"Typical minimum order: {b.wholesale_info.typical_minimum_order_kg}kg. "
-        f"Customer types: {', '.join(b.wholesale_info.customer_types)}."
-    )
-
-    lines.append(f"Payments: {b.payment_methods_note}")
-
+    c = knowledge.clinic
+    lines: List[str] = [
+        f"Clinic: {c.name} ({c.short_name}). {c.description}",
+        f"Address: {c.address}.",
+        f"Phone: {c.phone}. Email: {c.email}.",
+        f"Timings: {c.hours_summary()}.",
+        "Dentists:",
+    ]
+    for dentist in c.dentists:
+        lines.append(f"  - {dentist.name} ({dentist.qualification}): {dentist.focus}")
+    lines.append("Services offered (call clinic_faq_lookup for price ranges):")
+    for service in c.services:
+        lines.append(f"  - {service.name}: {service.description}")
+    lines.append(f"Booking: {c.booking_note}")
+    lines.append(f"Payments: {c.payment_methods_note}")
     lines.append("FAQs:")
-    for faq in b.faqs:
+    for faq in c.faqs:
         lines.append(f"  Q: {faq.question}")
         lines.append(f"  A: {faq.answer}")
-
-    return "\n".join(lines)
-
-
-def build_catalog_digest(knowledge: KnowledgeBase, max_items: Optional[int] = None) -> str:
-    """Build a compact, deterministic text digest of the product catalog.
-
-    Products are sorted by SKU for determinism. Intended as grounding
-    context for a future prompt builder; it is NOT the mechanism a future
-    ``product_lookup`` tool will use to answer specific queries.
-
-    Args:
-        knowledge: The loaded knowledge base.
-        max_items: Optional cap on the number of products included.
-    """
-    products = sorted(knowledge.catalog.products, key=lambda p: p.sku)
-    if max_items is not None:
-        products = products[:max_items]
-
-    lines: List[str] = [
-        f"Catalog (version {knowledge.catalog.catalog_version}, "
-        f"{len(knowledge.catalog.products)} products):"
-    ]
-    for p in products:
-        detail_bits = [f"{p.category.value}", f"INR {p.price_inr:g}"]
-        if p.size_g:
-            detail_bits.append(f"{p.size_g}g")
-        if p.roast_level:
-            detail_bits.append(f"{p.roast_level.value} roast")
-        detail_bits.append("in stock" if p.in_stock else "out of stock")
-        lines.append(f"  - {p.sku} | {p.name} | {', '.join(detail_bits)}")
-
     return "\n".join(lines)

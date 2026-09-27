@@ -11,14 +11,17 @@ os.environ["WHATSAPP_API_VERSION"] = "v22.0"
 os.environ["GROQ_API_KEY"] = "mock_groq_api_key_67890"
 os.environ["GROQ_MODEL"] = "llama-3.3-70b-versatile"
 os.environ["MAX_MEMORY_MESSAGES"] = "10"
+os.environ["DRAFTS_DB_PATH"] = ":memory:"
 
 from app.agent.handoff import InMemoryHandoffSink
 from app.agent.store import ConversationStore
+from app.approval import DraftQueue
 from app.config import Settings, get_settings
 from app.llm.base import ChatMessage, LLMProvider, LLMProviderError, LLMResponse
 from app.main import (
     app,
     get_conversation_store,
+    get_draft_queue,
     get_handoff_sink,
     get_llm_provider,
     get_memory,
@@ -118,7 +121,14 @@ def test_sink() -> InMemoryHandoffSink:
 
 
 @pytest.fixture
-def client(mock_settings, mock_llm, mock_wa, test_memory, test_store, test_sink) -> TestClient:
+def test_drafts() -> DraftQueue:
+    queue = DraftQueue(":memory:")
+    yield queue
+    queue.close()
+
+
+@pytest.fixture
+def client(mock_settings, mock_llm, mock_wa, test_memory, test_store, test_sink, test_drafts) -> TestClient:
     """Provide a TestClient with dependency overrides for isolated testing."""
     app.dependency_overrides[main_get_settings] = lambda: mock_settings
     app.dependency_overrides[get_llm_provider] = lambda: mock_llm
@@ -126,6 +136,7 @@ def client(mock_settings, mock_llm, mock_wa, test_memory, test_store, test_sink)
     app.dependency_overrides[get_memory] = lambda: test_memory
     app.dependency_overrides[get_conversation_store] = lambda: test_store
     app.dependency_overrides[get_handoff_sink] = lambda: test_sink
+    app.dependency_overrides[get_draft_queue] = lambda: test_drafts
 
     with TestClient(app) as test_client:
         yield test_client

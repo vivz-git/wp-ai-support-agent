@@ -16,9 +16,9 @@ state, validation, guardrails, escalation, tool execution, tool-call limits,
 error handling, persistence and the turn result. The LLM only supplies
 natural language and tool-call requests.
 
-Design constraints (Milestone 2, Slice 6):
-- Not wired into ``app.main`` or the webhook. The Milestone 1 request path
-  is untouched; switching the webhook over is a later slice.
+Design constraints:
+- ``app.main`` calls ``handle_turn`` from the webhook and queues the reply
+  as a draft for staff approval; nothing here sends a WhatsApp message.
 - Explicit bounded loops: at most ``AGENT_MAX_TOOL_ROUNDS`` tool rounds per
   turn, then ONE final text-only call with ``tools`` omitted entirely
   (never ``tool_choice="none"`` — confirmed unreliable on Groq in Slice 0).
@@ -28,7 +28,7 @@ Design constraints (Milestone 2, Slice 6):
   exception type only, returns a deterministic safe fallback reply, and
   still persists valid state.
 
-Lead extraction (Milestone 2, Slice 8):
+Lead extraction (patient booking details):
 - An optional ``LeadExtractor`` runs exactly once per customer turn, after
   the incoming guardrails allow the turn to continue and before the first
   prompt is built, so the model sees the current lead state. It never runs
@@ -37,13 +37,18 @@ Lead extraction (Milestone 2, Slice 8):
   ``ConversationState.apply_lead_delta``, which owns merge/provenance and
   recomputes qualification deterministically. The model never sets
   qualification or escalation; ``LeadDelta`` has no such fields.
+- Booking details are collected one at a time: each turn at most one
+  missing field (``LeadProfile.next_missing_field``) is authorized as the
+  question the model may ask, and none once the conversation is escalated,
+  handed off or declined.
 - Extraction is enrichment, not the response path: a failed, malformed,
   or crashing extraction leaves the lead profile untouched and the turn
   continues normally. It never triggers the safe fallback by itself.
 
-Guardrails + escalation (Milestone 2, Slice 10):
+Guardrails + escalation:
 - Incoming detectors (``InjectionDetector``, ``AngerScorer``,
-  ``RepetitionDetector``, ``HumanRequestDetector``) run exactly once per
+  ``RepetitionDetector``, ``HumanRequestDetector``, ``EmergencyDetector``)
+  run exactly once per
   customer turn, on the customer text only — never on tool output or
   model output. They are pure; the orchestrator owns every state change.
 - ``EscalationPolicy`` is evaluated on the incoming signals against the
@@ -52,7 +57,9 @@ Guardrails + escalation (Milestone 2, Slice 10):
   itself). Only afterwards does ``apply_signals_to_flags`` run, once.
 - A blocking incoming decision (``escalate`` / ``refuse`` / ``clarify``)
   is answered with a deterministic template from this module. No LLM call
-  and no lead extraction happen on such a turn.
+  and no lead extraction happen on such a turn. A dental emergency is
+  one of these: the patient gets the emergency callback reply in their own
+  language (English, Hindi or Hinglish) and never enters the booking flow.
 - Every candidate model reply is checked by ``GroundingValidator`` against
   the current-turn tool results *and* the ``KnowledgeBase`` before it may
   be sent. A rejected reply is never sent; the policy is re-evaluated with
@@ -66,7 +73,7 @@ Guardrails + escalation (Milestone 2, Slice 10):
 - Fail closed: a detector error skips the LLM for the turn (safe fallback),
   a policy error escalates, a validator error counts as ungrounded.
 
-Human handoff (Milestone 2, Slice 12):
+Human handoff:
 - An optional ``HandoffSink`` (``app.agent.handoff``) is injected through
   the constructor; there is no module-level sink. ``EscalationPolicy``
   stays the decision maker and the sink stays the delivery/storage
@@ -100,15 +107,18 @@ from app.agent.escalation import EscalationAction, EscalationDecision, Escalatio
 from app.agent.extraction import ExtractionResult, LeadExtractor
 from app.agent.guardrails import (
     AngerScorer,
+    EmergencyDetector,
     GroundingResult,
     GroundingValidator,
     GuardrailSignals,
     HumanRequestDetector,
     InjectionDetector,
+    PatientLanguage,
     RepetitionDetector,
     apply_signals_to_flags,
 )
 from app.agent.handoff import HandoffResult, HandoffSink, handoff_request_from_decision
+from app.agent.lead import BOOKING_QUESTIONS
 from app.agent.prompts import PromptBuilder
 from app.agent.state import ConversationState, EscalationStatus, MAX_MESSAGE_LENGTH, ToolInvocation
 from app.agent.store import ConversationStore
@@ -138,12 +148,32 @@ SAFE_FALLBACK_REPLY = "Sorry — I’m having trouble checking that right now. L
 # The model never writes a refusal, handoff, or clarification on the
 # policy's behalf.
 SAFE_REFUSAL_REPLY = (
-    "I can help with the coffee, orders, and support questions, "
+    "I can help with appointments, timings, and questions about our dental services, "
     "but I can't provide private system or credential information."
 )
 HUMAN_HANDOFF_REPLY = "I'll get a member of the team to help with this."
 CLARIFICATION_REPLY = "I want to make sure I understand. Could you clarify what you need?"
 UNVERIFIED_RECOVERY_REPLY = "Sorry — I couldn't verify that information reliably. Let me get the team to help."
+
+# Emergency callback reply, in the patient's own language/script. ``{clinic}``
+# is the clinic name from the knowledge base.
+EMERGENCY_REPLIES: Dict[str, str] = {
+    "en": (
+        "This sounds urgent, and I'm sorry you're going through this. I've alerted the {clinic} team "
+        "and the clinic will call you back shortly. If there is heavy bleeding, trouble breathing or "
+        "swallowing, or a serious injury, please go to the nearest hospital emergency department or call 112 right away."
+    ),
+    "hi": (
+        "यह ज़रूरी लग रहा है, हमें खेद है कि आपको तकलीफ़ हो रही है। मैंने {clinic} की टीम को सूचित कर दिया है, "
+        "क्लिनिक आपको जल्द ही कॉल करेगा। अगर बहुत ज़्यादा खून बह रहा हो, साँस लेने या निगलने में दिक्कत हो, "
+        "या गंभीर चोट हो, तो तुरंत नज़दीकी अस्पताल की इमरजेंसी में जाएँ या 112 पर कॉल करें।"
+    ),
+    "hinglish": (
+        "Yeh urgent lag raha hai, sorry aapko takleef ho rahi hai. Maine {clinic} team ko inform kar diya hai, "
+        "clinic aapko jaldi call karega. Agar bahut zyada khoon beh raha ho, saans lene ya nigalne mein dikkat ho, "
+        "ya koi serious chot ho, toh turant nazdeeki hospital emergency jaaiye ya 112 call kijiye."
+    ),
+}
 
 _INSTRUCTION_REPLIES: Dict[UserMessageInstruction, str] = {
     UserMessageInstruction.PROVIDE_SAFE_REFUSAL: SAFE_REFUSAL_REPLY,
@@ -155,11 +185,12 @@ _INSTRUCTION_REPLIES: Dict[UserMessageInstruction, str] = {
 # Instruction appended (as a system message) for the single corrective
 # generation. Carries grounding reason *codes* only — never customer text.
 CORRECTIVE_INSTRUCTION = (
-    "Your previous draft reply (the assistant message just above) stated product details that are not "
-    "supported by this turn's tool results or the business knowledge in your instructions "
-    "(problems: {codes}). Rewrite the reply using only facts that appear in those sources. Do not state "
-    "any price, availability, origin, or tasting note you cannot see there; if a detail cannot be "
-    "verified, say you will check with the team instead. Do not mention this correction."
+    "Your previous draft reply (the assistant message just above) stated clinic details that are not "
+    "supported by this turn's tool results or the clinic knowledge in your instructions, or gave medical "
+    "advice (problems: {codes}). Rewrite the reply using only facts that appear in those sources, in the "
+    "same language as before. Do not state any price or dentist you cannot see there, and never name a "
+    "medicine, dose, or home remedy; if a detail cannot be verified, say you will check with the clinic "
+    "team instead. Do not mention this correction."
 )
 
 # Actions that end the turn with a deterministic reply and no model call.
@@ -264,6 +295,7 @@ class TurnDiagnostics(BaseModel):
     error_type: Optional[str] = Field(None, description="Exception class name only, never its message")
     usage_prompt_tokens: int = Field(0, ge=0)
     usage_completion_tokens: int = Field(0, ge=0)
+    patient_language: Optional[str] = Field(None, description="en / hi / hinglish, from the emergency detector")
     # Lead extraction (field NAMES only; never extracted values or raw model output).
     extraction_attempted: bool = False
     extraction_success: bool = False
@@ -277,6 +309,8 @@ class TurnDiagnostics(BaseModel):
     anger_score: float = Field(0.0, ge=0.0, le=1.0)
     repetition_detected: bool = False
     human_requested: bool = False
+    emergency_detected: bool = False
+    emergency_reason_codes: List[str] = Field(default_factory=list, description="Symptom categories only")
     guardrail_error_types: List[str] = Field(default_factory=list, description="Exception class names only")
     # Outgoing grounding.
     grounding_checks: int = Field(0, ge=0, description="Candidate replies run through the validator")
@@ -436,12 +470,18 @@ def _result_error_code(result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _deterministic_reply(decision: EscalationDecision) -> str:
-    """Map a policy instruction to its fixed customer-facing text.
+def emergency_reply(language: PatientLanguage, clinic_name: str) -> str:
+    return EMERGENCY_REPLIES.get(language, EMERGENCY_REPLIES["en"]).format(clinic=clinic_name)
+
+
+def _deterministic_reply(decision: EscalationDecision, language: PatientLanguage, clinic_name: str) -> str:
+    """Map a policy instruction to its fixed patient-facing text.
 
     Unknown instructions fail closed to the handoff text rather than to a
     model-written reply.
     """
+    if decision.user_message_instruction == UserMessageInstruction.EMERGENCY_CALLBACK:
+        return emergency_reply(language, clinic_name)
     return _INSTRUCTION_REPLIES.get(decision.user_message_instruction, HUMAN_HANDOFF_REPLY)
 
 
@@ -487,6 +527,7 @@ class AgentOrchestrator:
         repetition: Optional[RepetitionDetector] = None,
         human_request: Optional[HumanRequestDetector] = None,
         handoff_sink: Optional[HandoffSink] = None,
+        emergency: Optional[EmergencyDetector] = None,
     ):
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must not be negative")
@@ -504,14 +545,15 @@ class AgentOrchestrator:
         # Guardrails and policy are always on; the arguments exist so tests
         # can substitute instrumented or failing components.
         self._policy = policy if policy is not None else EscalationPolicy()
-        # The catalog is the trusted source of truth for product facts, so a
-        # correct claim ("Yirgacheffe Light is ₹780.") grounds against it even
-        # when product_lookup was not called; wrong or unknown claims still fail.
-        self._grounding = grounding if grounding is not None else GroundingValidator(catalog_as_facts=True)
+        # Clinic data is the trusted source of truth for service prices, so a
+        # correct range ("Cleaning is ₹800–₹1,500.") grounds even when
+        # clinic_faq_lookup was not called; wrong or unknown claims still fail.
+        self._grounding = grounding if grounding is not None else GroundingValidator()
         self._injection = injection if injection is not None else InjectionDetector()
         self._anger = anger if anger is not None else AngerScorer()
         self._repetition = repetition if repetition is not None else RepetitionDetector()
         self._human_request = human_request if human_request is not None else HumanRequestDetector()
+        self._emergency = emergency if emergency is not None else EmergencyDetector()
 
     # -- Public API ---------------------------------------------------------
 
@@ -569,7 +611,7 @@ class AgentOrchestrator:
             ctx.fallback_reason = "guardrail_error"
         elif decision.action in _BLOCKING_ACTIONS:
             # Deterministic reply; no extraction, no model, no tools.
-            reply_text = _deterministic_reply(decision)
+            reply_text = self._deterministic_reply(ctx, decision)
             ctx.reply_source = "policy"
             self._apply_decision(ctx, decision)
         else:
@@ -651,6 +693,7 @@ class AgentOrchestrator:
             ("anger", lambda: self._anger.score(ctx.text)),
             ("repetition", lambda: self._repetition.detect(ctx.text, history)),
             ("human_request", lambda: self._human_request.detect(ctx.text)),
+            ("emergency", lambda: self._emergency.detect(ctx.text)),
         )
         for name, run in detectors:
             try:
@@ -700,6 +743,11 @@ class AgentOrchestrator:
         # is an explicit consent step owned by a later slice, and a sink
         # accepting a request is not a human taking over (``mark_handed_off``).
         ctx.applied_decision = decision
+
+    def _deterministic_reply(self, ctx: _TurnContext, decision: EscalationDecision) -> str:
+        emergency = ctx.signals.emergency
+        language: PatientLanguage = emergency.language if emergency is not None else "en"
+        return _deterministic_reply(decision, language, self._knowledge.clinic.name)
 
     # -- Human handoff ------------------------------------------------------
 
@@ -859,7 +907,7 @@ class AgentOrchestrator:
         ctx.fallback_reason = "ungrounded_reply"
         decision = ctx.decision if ctx.decision is not None else _POLICY_ERROR_DECISION
         self._apply_decision(ctx, decision)
-        return _deterministic_reply(decision), loop_exit
+        return self._deterministic_reply(ctx, decision), loop_exit
 
     def _accept_candidate(self, ctx: _TurnContext, candidate: str) -> bool:
         """Grounding check + outgoing policy for one candidate reply.
@@ -960,9 +1008,22 @@ class AgentOrchestrator:
             knowledge=self._knowledge,
             current_message=ctx.text,
             tool_results=tool_results or None,
-            allowed_question=None,  # qualification policy is a later slice
+            allowed_question=self._allowed_question(ctx.state),
         )
         return bundle.to_messages() + list(ctx.transcript)
+
+    @staticmethod
+    def _allowed_question(state: ConversationState) -> Optional[str]:
+        """The one booking question the model may ask this turn, or ``None``.
+
+        Deterministic: the first missing field in ``QUESTION_ORDER``. None
+        once the conversation is escalated, handed off, declined, or the
+        booking request is complete.
+        """
+        if state.is_terminal or state.escalation.status != EscalationStatus.NONE:
+            return None
+        field_name = state.lead.next_missing_field()
+        return BOOKING_QUESTIONS[field_name] if field_name is not None else None
 
     def _llm_tool_specs(self) -> List[LLMToolSpec]:
         """Registry schemas -> the ``ToolSpec`` shape ``complete()`` accepts."""
@@ -1135,6 +1196,7 @@ class AgentOrchestrator:
             error_type=error_type,
             usage_prompt_tokens=ctx.usage_prompt_tokens,
             usage_completion_tokens=ctx.usage_completion_tokens,
+            patient_language=signals.emergency.language if signals.emergency is not None else None,
             extraction_attempted=ctx.extraction_attempted,
             extraction_success=ctx.extraction_success,
             extraction_source=ctx.extraction_source,
@@ -1146,6 +1208,8 @@ class AgentOrchestrator:
             anger_score=signals.anger.score if signals.anger is not None else 0.0,
             repetition_detected=bool(signals.repetition is not None and signals.repetition.repeated),
             human_requested=bool(signals.human_request is not None and signals.human_request.requested),
+            emergency_detected=bool(signals.emergency is not None and signals.emergency.detected),
+            emergency_reason_codes=list(signals.emergency.reason_codes) if signals.emergency is not None else [],
             guardrail_error_types=list(ctx.guardrail_error_types),
             grounding_checks=ctx.grounding_checks,
             grounding_violation_count=ctx.grounding_violation_count,
@@ -1173,6 +1237,7 @@ __all__ = [
     "AgentTurnResult",
     "CLARIFICATION_REPLY",
     "CORRECTIVE_INSTRUCTION",
+    "EMERGENCY_REPLIES",
     "HUMAN_HANDOFF_REPLY",
     "MAX_CORRECTIVE_GENERATIONS",
     "MAX_INVALID_INPUT_RETRIES",
@@ -1181,4 +1246,5 @@ __all__ = [
     "ToolCallRecord",
     "TurnDiagnostics",
     "UNVERIFIED_RECOVERY_REPLY",
+    "emergency_reply",
 ]

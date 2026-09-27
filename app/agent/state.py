@@ -2,12 +2,11 @@
 
 ``ConversationState`` is the single, validated record of one sender's
 conversation: what they said, what we said, what we think they want, what
-we know about them as a lead, which tools ran, and the behavioural
-signals later guardrail/escalation slices will act on.
+we know about them as a patient lead, which tools ran, and the behavioural
+signals the guardrail/escalation rules act on.
 
-Design constraints (Milestone 2, Slice 4):
+Design constraints:
 - Pure data model. No orchestrator, no prompt, no LLM, no network.
-- Not wired into ``app.main`` — the Milestone 1 request path is untouched.
 - The state evolves across turns, so it is mutable, but every mutation
   path re-validates (``validate_assignment=True``) and the bounded
   collections are trimmed on both append and load.
@@ -56,12 +55,11 @@ class InvalidTransitionError(ValueError):
 
 class Intent(str, Enum):
     FAQ = "faq"
-    PRODUCT_INQUIRY = "product_inquiry"
-    RECOMMENDATION = "recommendation"
+    SERVICE_INQUIRY = "service_inquiry"
     PRICE_CHECK = "price_check"
-    AVAILABILITY_CHECK = "availability_check"
-    WHOLESALE_INQUIRY = "wholesale_inquiry"
-    ORDER_STATUS = "order_status"
+    BOOKING = "booking"
+    APPOINTMENT_STATUS = "appointment_status"
+    EMERGENCY = "emergency"
     COMPLAINT = "complaint"
     HUMAN_REQUEST = "human_request"
     SMALLTALK = "smalltalk"

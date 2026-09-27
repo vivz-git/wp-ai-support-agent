@@ -20,7 +20,6 @@ from app.agent import (
     Intent,
     InvalidTransitionError,
     LeadDelta,
-    LeadTrack,
     QualificationState,
     ToolInvocation,
 )
@@ -36,21 +35,17 @@ from app.llm.base import ChatMessage
 
 SENDER = "919876543210"
 
-WHOLESALE_DELTA = LeadDelta(
-    track="wholesale",
-    contact_name="Asha Rao",
-    business_name="Third Wave Cafe",
-    business_type="cafe",
-    monthly_volume_kg=25,
-    city="Bengaluru",
-    timeline="within_1_month",
+BOOKING_DELTA = LeadDelta(
+    patient_name="Asha Rao",
+    concern="teeth cleaning",
+    preferred_day_time="Saturday 11am",
 )
 
 
 def _qualified_state() -> ConversationState:
     state = ConversationState.new(SENDER)
     state.begin_turn()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     assert state.qualification == QualificationState.QUALIFIED
     return state
 
@@ -63,12 +58,11 @@ def _qualified_state() -> ConversationState:
 def test_intent_enum_values():
     assert [i.value for i in Intent] == [
         "faq",
-        "product_inquiry",
-        "recommendation",
+        "service_inquiry",
         "price_check",
-        "availability_check",
-        "wholesale_inquiry",
-        "order_status",
+        "booking",
+        "appointment_status",
+        "emergency",
         "complaint",
         "human_request",
         "smalltalk",
@@ -91,10 +85,6 @@ def test_qualification_state_enum_values():
 
 def test_escalation_status_enum_values():
     assert [e.value for e in EscalationStatus] == ["none", "pending", "handed_off"]
-
-
-def test_lead_track_enum_values():
-    assert [t.value for t in LeadTrack] == ["unknown", "consumer", "wholesale"]
 
 
 def test_enums_are_string_valued():
@@ -155,13 +145,13 @@ def test_state_rejects_blank_sender_and_unknown_fields():
 
 def test_state_serialization_round_trip():
     state = _qualified_state()
-    state.set_intent(Intent.WHOLESALE_INQUIRY, 0.93)
-    state.add_user_message("We run a cafe and need about 25kg a month")
+    state.set_intent(Intent.BOOKING, 0.93)
+    state.add_user_message("I would like a cleaning on Saturday")
     state.add_assistant_message("Great — let me note that down.")
     state.record_tool_invocation(
-        ToolInvocation(tool_name="product_lookup", turn=1, status="ok", ok=True, arguments={"query": "espresso"}, result={"status": "ok"})
+        ToolInvocation(tool_name="clinic_faq_lookup", turn=1, status="ok", ok=True, arguments={"query": "rct"}, result={"status": "ok"})
     )
-    state.remember_fact("preferred_roast", "medium_dark")
+    state.remember_fact("preferred_dentist", "Dr. Rohan Mehta")
     state.flags.anger_score = 0.2
 
     payload = state.model_dump(mode="json")
@@ -170,7 +160,7 @@ def test_state_serialization_round_trip():
 
     assert restored == state
     assert restored.model_dump(mode="json") == payload
-    assert restored.lead.track == LeadTrack.WHOLESALE
+    assert restored.lead.concern == "teeth cleaning"
     assert restored.qualification == QualificationState.QUALIFIED
     assert restored.current_turn_tool_results[0].result == {"status": "ok"}
     assert restored.tool_history[0].result is None
@@ -279,7 +269,7 @@ def test_tool_history_is_bounded_and_current_turn_resets():
     state = ConversationState.new(SENDER)
     for i in range(MAX_TOOL_HISTORY + 3):
         state.begin_turn()
-        state.record_tool_invocation(ToolInvocation(tool_name="product_lookup", turn=i, status="ok", ok=True))
+        state.record_tool_invocation(ToolInvocation(tool_name="clinic_faq_lookup", turn=i, status="ok", ok=True))
     assert len(state.tool_history) == MAX_TOOL_HISTORY
     assert len(state.current_turn_tool_results) == 1
     state.begin_turn()
@@ -289,8 +279,8 @@ def test_tool_history_is_bounded_and_current_turn_resets():
 def test_tool_failures_this_turn_counts_and_resets():
     state = ConversationState.new(SENDER)
     state.begin_turn()
-    state.record_tool_invocation(ToolInvocation(tool_name="product_lookup", turn=1, status="unavailable", ok=False))
-    state.record_tool_invocation(ToolInvocation(tool_name="product_lookup", turn=1, status="ok", ok=True))
+    state.record_tool_invocation(ToolInvocation(tool_name="clinic_faq_lookup", turn=1, status="unavailable", ok=False))
+    state.record_tool_invocation(ToolInvocation(tool_name="clinic_faq_lookup", turn=1, status="ok", ok=True))
     assert state.flags.tool_failures_this_turn == 1
     state.begin_turn()
     assert state.flags.tool_failures_this_turn == 0
@@ -320,9 +310,9 @@ def test_transition_unknown_to_browsing_to_collecting():
     state.begin_turn()
     assert state.reevaluate_qualification() == QualificationState.BROWSING
 
-    state.apply_lead_delta(LeadDelta(contact_name="Asha"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha"))
     assert state.qualification == QualificationState.COLLECTING
-    assert state.lead.field_provenance == {"contact_name": 1}
+    assert state.lead.field_provenance == {"patient_name": 1}
 
 
 def test_apply_lead_delta_uses_current_turn_for_provenance():
@@ -330,8 +320,8 @@ def test_apply_lead_delta_uses_current_turn_for_provenance():
     state.begin_turn()
     state.begin_turn()
     state.begin_turn()
-    state.apply_lead_delta(LeadDelta(city="Pune"))
-    assert state.lead.field_provenance == {"city": 3}
+    state.apply_lead_delta(LeadDelta(concern="braces"))
+    assert state.lead.field_provenance == {"concern": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -342,18 +332,18 @@ def test_apply_lead_delta_uses_current_turn_for_provenance():
 def test_transition_collecting_to_qualified_across_turns():
     state = ConversationState.new(SENDER)
     state.begin_turn()
-    state.apply_lead_delta(LeadDelta(track="wholesale", contact_name="Asha Rao", business_name="Third Wave Cafe"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha Rao", concern="teeth cleaning"))
     assert state.qualification == QualificationState.COLLECTING
 
     state.begin_turn()
-    state.apply_lead_delta(LeadDelta(business_type="cafe", monthly_volume_kg=25))
+    state.apply_lead_delta(LeadDelta(concern="teeth cleaning"))
     assert state.qualification == QualificationState.COLLECTING
 
     state.begin_turn()
-    result = state.apply_lead_delta(LeadDelta(city="Bengaluru", timeline="immediate"))
+    result = state.apply_lead_delta(LeadDelta(preferred_day_time="Saturday 11am"))
     assert result == QualificationState.QUALIFIED
     assert state.qualification == QualificationState.QUALIFIED
-    assert state.lead.field_provenance["timeline"] == 3
+    assert state.lead.field_provenance["preferred_day_time"] == 3
     assert state.is_terminal is False
 
 
@@ -363,7 +353,7 @@ def test_qualification_cannot_be_set_by_a_delta():
     with pytest.raises(ValidationError):
         LeadDelta(qualification="qualified")
     # A bare-minimum delta still leaves the state unqualified.
-    state.apply_lead_delta(LeadDelta(contact_name="Asha"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha"))
     assert state.qualification == QualificationState.COLLECTING
 
 
@@ -390,7 +380,7 @@ def test_transition_qualified_to_handoff_ready():
 def test_handoff_ready_requires_qualified():
     state = ConversationState.new(SENDER)
     state.begin_turn()
-    state.apply_lead_delta(LeadDelta(contact_name="Asha"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha"))
     with pytest.raises(InvalidTransitionError):
         state.mark_handoff_ready()
     assert state.qualification == QualificationState.COLLECTING
@@ -426,16 +416,16 @@ def test_handed_off_requires_pending_or_handoff_ready():
 def test_declined_state():
     state = ConversationState.new(SENDER)
     state.begin_turn()
-    state.apply_lead_delta(LeadDelta(contact_name="Asha"))
+    state.apply_lead_delta(LeadDelta(patient_name="Asha"))
     assert state.mark_declined() == QualificationState.DECLINED
     assert state.flags.declines == 1
     assert state.is_terminal is True
 
     # Sticky: more data does not silently re-qualify a declined lead.
     state.begin_turn()
-    state.apply_lead_delta(WHOLESALE_DELTA)
+    state.apply_lead_delta(BOOKING_DELTA)
     assert state.qualification == QualificationState.DECLINED
-    assert state.lead.business_name == "Third Wave Cafe"  # data still recorded
+    assert state.lead.concern == "teeth cleaning"  # data still recorded
 
 
 def test_declined_from_qualified():
@@ -459,9 +449,9 @@ def test_escalated_state_from_any_state():
     for setup in (
         lambda s: None,
         lambda s: s.begin_turn(),
-        lambda s: (s.begin_turn(), s.apply_lead_delta(LeadDelta(contact_name="Asha"))),
-        lambda s: (s.begin_turn(), s.apply_lead_delta(WHOLESALE_DELTA)),
-        lambda s: (s.begin_turn(), s.apply_lead_delta(WHOLESALE_DELTA), s.mark_handoff_ready()),
+        lambda s: (s.begin_turn(), s.apply_lead_delta(LeadDelta(patient_name="Asha"))),
+        lambda s: (s.begin_turn(), s.apply_lead_delta(BOOKING_DELTA)),
+        lambda s: (s.begin_turn(), s.apply_lead_delta(BOOKING_DELTA), s.mark_handoff_ready()),
         lambda s: s.mark_declined(),
     ):
         state = ConversationState.new(SENDER)
@@ -661,14 +651,14 @@ def test_sender_isolation():
     a = "919876543210"
     b = "919876543211"
 
-    store.update(a, lambda s: (s.begin_turn(), s.apply_lead_delta(WHOLESALE_DELTA)))
+    store.update(a, lambda s: (s.begin_turn(), s.apply_lead_delta(BOOKING_DELTA)))
     store.update(b, lambda s: (s.begin_turn(), s.add_user_message("just browsing")))
 
     state_a = store.get(a)
     state_b = store.get(b)
     assert state_a.qualification == QualificationState.QUALIFIED
     assert state_b.qualification == QualificationState.UNKNOWN
-    assert state_b.lead.business_name is None
+    assert state_b.lead.concern is None
     assert state_b.lead.whatsapp_number == b
     assert state_a.history == []
     assert state_b.history[0].content == "just browsing"
@@ -686,8 +676,8 @@ def test_sender_isolation():
 def test_state_survives_save_load_and_store_snapshot():
     store = ConversationStore(capacity=10)
     state = _qualified_state()
-    state.set_intent(Intent.WHOLESALE_INQUIRY, 0.9)
-    state.add_user_message("25kg per month please")
+    state.set_intent(Intent.BOOKING, 0.9)
+    state.add_user_message("Saturday 11am please")
     state.remember_fact("wants_sample", "yes")
     state.flags.repeated_question_count = 2
     state.mark_handoff_ready()
@@ -739,8 +729,8 @@ def test_agent_state_and_store_perform_no_network_access(monkeypatch):
         lambda s: (
             s.begin_turn(),
             s.add_user_message("hello"),
-            s.set_intent(Intent.WHOLESALE_INQUIRY, 0.9),
-            s.apply_lead_delta(WHOLESALE_DELTA),
+            s.set_intent(Intent.BOOKING, 0.9),
+            s.apply_lead_delta(BOOKING_DELTA),
             s.mark_handoff_ready(),
         ),
     )

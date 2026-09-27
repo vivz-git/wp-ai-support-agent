@@ -39,3 +39,6 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Staff approval queue (SQLite)
+*.db

@@ -18,6 +18,7 @@ so applying the flags first would double count.
 Decision priority (lower number wins; every rule that fires is kept in
 ``reason_codes`` in this order):
 
+     1  dental emergency           -> escalate      (clinic calls the patient back)
      1  grounding violation        -> suppress      (unsafe output never ships)
      2  already escalated (sticky) -> escalate
      3  explicit human request     -> escalate
@@ -30,6 +31,13 @@ Decision priority (lower number wins; every rule that fires is kept in
     10  high anger, no complaint context -> clarify
     11  single repetition          -> clarify
     12  nothing fired              -> continue
+
+A dental emergency (pain, bleeding, swelling, trauma) outranks everything,
+including a sticky escalation and every injection rule: a patient in pain
+gets the emergency callback reply and an urgent handoff, and never enters
+the normal booking flow on that turn. It shares rank 1 with grounding, but
+the two never meet: emergency is an incoming signal and grounding an
+outgoing one, and on a tie ``dental_emergency`` sorts first anyway.
 
 Grounding outranks even a sticky escalation because an ungrounded reply
 must not be sent regardless of who will handle the conversation next; the
@@ -78,7 +86,7 @@ REPEAT_ESCALATION_THRESHOLD = 2
 # attempt counts as repeated/aggressive.
 INJECTION_ESCALATION_HITS = 3
 
-_COMPLAINT_INTENTS = frozenset({Intent.COMPLAINT, Intent.ORDER_STATUS})
+_COMPLAINT_INTENTS = frozenset({Intent.COMPLAINT, Intent.APPOINTMENT_STATUS})
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +109,7 @@ class UserMessageInstruction(str, Enum):
     PROVIDE_SAFE_REFUSAL = "provide_safe_refusal"
     SUPPRESS_UNGROUNDED_CLAIM = "suppress_ungrounded_claim"
     OFFER_HUMAN_HANDOFF = "offer_human_handoff"
+    EMERGENCY_CALLBACK = "emergency_callback"
 
 
 class EscalationDecision(BaseModel):
@@ -152,6 +161,7 @@ class EscalationPolicy:
 
     def evaluate(self, signals: GuardrailSignals, state: ConversationState) -> EscalationDecision:
         candidates: List[_Candidate] = []
+        candidates.extend(self._emergency_rule(signals))
         candidates.extend(self._grounding_rule(signals))
         candidates.extend(self._sticky_escalation_rule(state))
         candidates.extend(self._human_request_rule(signals, state))
@@ -178,6 +188,13 @@ class EscalationPolicy:
         )
 
     # -- Rules ----------------------------------------------------------------
+
+    @staticmethod
+    def _emergency_rule(signals: GuardrailSignals) -> List[_Candidate]:
+        emergency = signals.emergency
+        if emergency is None or not emergency.detected:
+            return []
+        return [(1, EscalationAction.ESCALATE, "dental_emergency", UserMessageInstruction.EMERGENCY_CALLBACK)]
 
     @staticmethod
     def _grounding_rule(signals: GuardrailSignals) -> List[_Candidate]:

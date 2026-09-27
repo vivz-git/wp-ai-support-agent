@@ -1,0 +1,133 @@
+{
+  "is_fictional": true,
+  "fictional_notice": "SmileCare Dental is a fictional clinic created for a public portfolio project (WP_AI_Support_Agent). It is not a real clinic, and the dentists, address, phone number and prices are invented. Any resemblance to an actual clinic or person is coincidental.",
+  "name": "SmileCare Dental",
+  "short_name": "SmileCare",
+  "description": "A family dental clinic in Pune offering check-ups, cleaning, root canal treatment, braces and teeth whitening.",
+  "address": "2nd Floor, Shanti Plaza, 14 FC Road, Shivajinagar, Pune, Maharashtra 411005",
+  "city": "Pune",
+  "phone": "+91 00000 12345",
+  "email": "hello@smilecare.example.invalid",
+  "hours": [
+    { "day": "monday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "tuesday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "wednesday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "thursday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "friday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "saturday", "open": "10:00", "close": "20:00", "closed": false },
+    { "day": "sunday", "closed": true }
+  ],
+  "dentists": [
+    {
+      "id": "dr-kulkarni",
+      "name": "Dr. Ananya Kulkarni",
+      "qualification": "BDS, MDS (Endodontics)",
+      "focus": "Root canal treatment and tooth pain"
+    },
+    {
+      "id": "dr-mehta",
+      "name": "Dr. Rohan Mehta",
+      "qualification": "BDS, MDS (Orthodontics)",
+      "focus": "Braces and teeth alignment"
+    },
+    {
+      "id": "dr-sheikh",
+      "name": "Dr. Farah Sheikh",
+      "qualification": "BDS",
+      "focus": "General check-ups, cleaning, whitening and children's dentistry"
+    }
+  ],
+  "services": [
+    {
+      "id": "svc-consultation",
+      "name": "Consultation and check-up",
+      "aliases": ["consultation", "consult", "checkup", "check up", "check-up", "dental checkup", "first visit", "consultation fees", "doctor fees", "jaanch", "janch", "परामर्श", "जांच", "जाँच", "चेकअप"],
+      "description": "Examination by a dentist, with a treatment plan if anything is needed.",
+      "price_min_inr": 300,
+      "price_max_inr": 500,
+      "price_note": "X-rays, if needed, are charged separately."
+    },
+    {
+      "id": "svc-cleaning",
+      "name": "Teeth cleaning (scaling and polishing)",
+      "aliases": ["cleaning", "teeth cleaning", "scaling", "polishing", "scaling and polishing", "safai", "saaf", "daant saaf", "dant saaf", "सफाई", "सफ़ाई", "स्केलिंग"],
+      "description": "Removal of tartar and stains, followed by polishing.",
+      "price_min_inr": 800,
+      "price_max_inr": 1500,
+      "price_note": "Depends on how much tartar has built up."
+    },
+    {
+      "id": "svc-root-canal",
+      "name": "Root canal treatment (RCT)",
+      "aliases": ["root canal", "root canal treatment", "root canal therapy", "rct", "r c t", "nerve treatment", "रूट कैनाल", "आरसीटी"],
+      "description": "Treatment of an infected or damaged tooth nerve, usually over one to three visits.",
+      "price_min_inr": 3500,
+      "price_max_inr": 8000,
+      "price_note": "Per tooth. A crown, if advised, is charged separately."
+    },
+    {
+      "id": "svc-braces",
+      "name": "Braces",
+      "aliases": ["braces", "brace", "orthodontic", "orthodontics", "orthodontic treatment", "teeth straightening", "tedhe daant", "tedhe dant", "ब्रेसेस", "ब्रेसिज़", "टेढ़े दांत", "टेढ़े दाँत"],
+      "description": "Metal or ceramic braces to straighten teeth, with monthly adjustment visits.",
+      "price_min_inr": 35000,
+      "price_max_inr": 90000,
+      "price_note": "Full treatment. Metal braces are at the lower end and ceramic at the higher end; EMI is available."
+    },
+    {
+      "id": "svc-whitening",
+      "name": "Teeth whitening",
+      "aliases": ["whitening", "teeth whitening", "bleaching", "white teeth", "daant safed", "dant safed", "safed daant", "व्हाइटनिंग", "दांत सफेद", "दाँत सफेद", "दांत सफ़ेद"],
+      "description": "In-clinic whitening to lighten stains and discolouration.",
+      "price_min_inr": 5000,
+      "price_max_inr": 12000,
+      "price_note": "Depends on the method and number of sessions."
+    }
+  ],
+  "booking_note": "Patients share their name, concern and a preferred day and time on WhatsApp. The front desk confirms the final slot; the assistant never confirms an appointment itself.",
+  "payment_methods_note": "Cash, UPI and debit/credit cards are accepted at the clinic. The WhatsApp assistant never collects payment or card details.",
+  "faqs": [
+    {
+      "id": "faq-booking",
+      "question": "How do I book an appointment?",
+      "answer": "Share your name, what you need help with, and a preferred day and time here on WhatsApp. Our front desk will confirm the slot with you.",
+      "keywords": ["appointment", "book", "booking", "slot", "visit", "milna", "appointment chahiye", "अपॉइंटमेंट", "बुक", "समय लेना"]
+    },
+    {
+      "id": "faq-payment",
+      "question": "What payment methods do you accept?",
+      "answer": "Cash, UPI and debit/credit cards at the clinic. EMI options are available for braces.",
+      "keywords": ["payment", "pay", "upi", "card", "cash", "emi", "installment", "kisht", "भुगतान", "पेमेंट"]
+    },
+    {
+      "id": "faq-insurance",
+      "question": "Do you accept dental insurance?",
+      "answer": "We don't offer cashless insurance, but we provide bills and treatment documents for reimbursement claims.",
+      "keywords": ["insurance", "claim", "cashless", "reimbursement", "mediclaim", "बीमा", "इंश्योरेंस"]
+    },
+    {
+      "id": "faq-emergency",
+      "question": "What should I do in a dental emergency?",
+      "answer": "Message us here and our team will call you back as soon as possible. For heavy bleeding, swelling that affects breathing or swallowing, or a serious injury, go to the nearest hospital emergency department or call 112.",
+      "keywords": ["emergency", "urgent", "immediately", "turant", "इमरजेंसी", "तुरंत"]
+    },
+    {
+      "id": "faq-children",
+      "question": "Do you treat children?",
+      "answer": "Yes. Our dentists see children from the age of 3.",
+      "keywords": ["children", "child", "kids", "kid", "son", "daughter", "baccha", "bacche", "bachcha", "बच्चा", "बच्चे"]
+    },
+    {
+      "id": "faq-parking",
+      "question": "Is there parking at the clinic?",
+      "answer": "Two-wheeler parking is available in the building. Car parking is on the street.",
+      "keywords": ["parking", "park", "car", "bike", "पार्किंग"]
+    },
+    {
+      "id": "faq-price-final",
+      "question": "Are the prices final?",
+      "answer": "Prices are rough ranges. The dentist confirms the exact cost after examining you.",
+      "keywords": ["final", "exact", "estimate", "fixed price", "pakka", "पक्का"]
+    }
+  ]
+}

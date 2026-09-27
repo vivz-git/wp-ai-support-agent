@@ -1,6 +1,6 @@
-"""Comprehensive integration tests for Milestone 2 Slice 15: Live WhatsApp Agent Integration.
+"""End-to-end integration tests for the live WhatsApp agent with staff approval.
 
-Verifies end-to-end webhook handling:
+Verifies webhook handling:
 Meta WhatsApp Webhook
         ↓
 webhook verification / parsing
@@ -9,9 +9,11 @@ WAMID duplicate check (idempotency)
         ↓
 AgentOrchestrator.handle_turn(...)
         ↓
-WhatsAppClient.send_text(...)
+DraftQueue.add(...)  (pending staff approval; nothing is sent)
         ↓
 HTTP 200 acknowledgement
+
+and the staff side: /staff approve -> WhatsAppClient.send_text(...).
 
 All tests use mocks, fakes, and in-memory stores. No live network calls are made.
 """
@@ -48,12 +50,14 @@ from app.agent.orchestrator import (
 )
 from app.agent.state import ConversationState, EscalationStatus
 from app.agent.store import ConversationStore
+from app.approval import DraftQueue
 from app.config import mask_phone_number
 from app.knowledge import KnowledgeBase, get_knowledge_base
 from app.llm.base import ChatMessage, LLMProvider, LLMProviderError, LLMResponse, ToolCall
 from app.main import (
     app,
     get_conversation_store,
+    get_draft_queue,
     get_handoff_sink,
     get_knowledge,
     get_lead_extractor,
@@ -83,7 +87,7 @@ class IntegrationLLM(LLMProvider):
     def __init__(
         self,
         responses: Optional[List[Union[LLMResponse, Exception]]] = None,
-        default_text: str = "Hello! Kettle & Bloom offers freshly roasted specialty coffee.",
+        default_text: str = "Hello! SmileCare Dental offers check-ups, cleaning, root canals, braces and whitening.",
         extraction_response: Optional[str] = "{}",
     ):
         self.responses = list(responses) if responses else []
@@ -149,7 +153,7 @@ class RecordingWhatsAppClient:
 
 
 def make_payload(
-    text: str = "Hello, how much is the Ethiopia coffee?",
+    text: str = "Hello, what services do you offer?",
     sender: str = "919876543210",
     message_id: str = "wamid.test_msg_001",
 ) -> Dict[str, Any]:
@@ -210,6 +214,7 @@ def test_env():
     sink = InMemoryHandoffSink()
     tools = default_registry
     knowledge = get_knowledge_base()
+    drafts = DraftQueue(":memory:")
 
     app.dependency_overrides[get_llm_provider] = lambda: llm
     app.dependency_overrides[get_whatsapp_client] = lambda: wa_client
@@ -218,6 +223,7 @@ def test_env():
     app.dependency_overrides[get_handoff_sink] = lambda: sink
     app.dependency_overrides[get_tool_registry] = lambda: tools
     app.dependency_overrides[get_knowledge] = lambda: knowledge
+    app.dependency_overrides[get_draft_queue] = lambda: drafts
 
     with TestClient(app) as client:
         yield {
@@ -229,9 +235,16 @@ def test_env():
             "sink": sink,
             "tools": tools,
             "knowledge": knowledge,
+            "drafts": drafts,
         }
 
     app.dependency_overrides.clear()
+    drafts.close()
+
+
+def drafted(test_env) -> List[str]:
+    """Texts of the drafts waiting for staff approval, oldest first."""
+    return [d.draft_text for d in sorted(test_env["drafts"].list_pending(), key=lambda d: d.id)]
 
 
 # ---------------------------------------------------------------------------
@@ -275,37 +288,49 @@ def test_02_valid_text_webhook_calls_agent_orchestrator(test_env):
 
     resp = client.post("/webhook/whatsapp", json=payload)
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
+    assert resp.json()["status"] == "pending_approval"
     assert resp.json()["message_id"] == "wamid.002"
 
     assert len(llm.agent_calls) == 1
-    assert len(wa_client.sent_messages) == 1
+    assert len(drafted(test_env)) == 1
+    assert wa_client.sent_messages == []
 
 
 def test_03_legacy_get_agent_reply_not_used(test_env):
     """3. Legacy get_agent_reply is no longer used in production path."""
     client = test_env["client"]
-    payload = make_payload(text="Do you sell beans?", message_id="wamid.003")
+    payload = make_payload(text="Do you do braces?", message_id="wamid.003")
 
     # If get_agent_reply is invoked, IntegrationLLM raises AssertionError
     resp = client.post("/webhook/whatsapp", json=payload)
     assert resp.status_code == 200
 
 
-def test_04_agent_turn_result_reply_sent_via_whatsapp(test_env):
-    """4. AgentTurnResult.reply_text is sent through WhatsAppClient."""
+def test_04_agent_turn_result_reply_is_queued_then_sent_on_approval(test_env):
+    """4. AgentTurnResult.reply_text is queued as a draft and only sent through
+    WhatsAppClient once staff approve it."""
     client = test_env["client"]
     llm = test_env["llm"]
     wa_client = test_env["wa_client"]
-    llm.default_text = "We roast on Tuesdays and ship nationwide."
+    llm.default_text = "We are open Monday to Saturday, 10 AM to 8 PM."
 
-    payload = make_payload(text="When do you roast?", sender="919876543210", message_id="wamid.004")
+    payload = make_payload(text="When are you open?", sender="919876543210", message_id="wamid.004")
     resp = client.post("/webhook/whatsapp", json=payload)
 
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    assert wa_client.sent_messages[0]["to"] == "919876543210"
-    assert wa_client.sent_messages[0]["body"] == "We roast on Tuesdays and ship nationwide."
+    assert drafted(test_env) == ["We are open Monday to Saturday, 10 AM to 8 PM."]
+    assert wa_client.sent_messages == []
+
+    approve = client.post(
+        f"/staff/drafts/{resp.json()['draft_id']}/approve",
+        data={"text": "We are open Monday to Saturday, 10 AM to 8 PM."},
+        follow_redirects=False,
+    )
+    assert approve.status_code == 303
+    assert wa_client.sent_messages == [
+        {"to": "919876543210", "body": "We are open Monday to Saturday, 10 AM to 8 PM."}
+    ]
+    assert drafted(test_env) == []
 
 
 def test_05_wamid_extracted_correctly(test_env):
@@ -328,8 +353,9 @@ def test_06_wamid_first_delivery_processes(test_env):
 
     resp = client.post("/webhook/whatsapp", json=payload)
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
-    assert len(wa_client.sent_messages) == 1
+    assert resp.json()["status"] == "pending_approval"
+    assert len(drafted(test_env)) == 1
+    assert wa_client.sent_messages == []
 
 
 def test_07_to_10_duplicate_wamid_early_return(test_env):
@@ -337,7 +363,7 @@ def test_07_to_10_duplicate_wamid_early_return(test_env):
     7. returns early (duplicate_ignored)
     8. does not call agent
     9. does not call LLM
-    10. does not send WhatsApp reply.
+    10. does not queue a second draft.
     """
     client = test_env["client"]
     llm = test_env["llm"]
@@ -347,12 +373,12 @@ def test_07_to_10_duplicate_wamid_early_return(test_env):
     # First delivery
     resp1 = client.post("/webhook/whatsapp", json=payload)
     assert resp1.status_code == 200
-    assert resp1.json()["status"] == "ok"
+    assert resp1.json()["status"] == "pending_approval"
 
     total_calls_after_first = len(llm.calls)
     agent_calls_after_first = len(llm.agent_calls)
-    sends_after_first = len(wa_client.sent_messages)
-    assert sends_after_first == 1
+    drafts_after_first = len(drafted(test_env))
+    assert drafts_after_first == 1
 
     # Second delivery with identical WAMID
     resp2 = client.post("/webhook/whatsapp", json=payload)
@@ -364,8 +390,9 @@ def test_07_to_10_duplicate_wamid_early_return(test_env):
     assert len(llm.agent_calls) == agent_calls_after_first
     # 9. No additional LLM call
     assert len(llm.calls) == total_calls_after_first
-    # 10. No additional WhatsApp send
-    assert len(wa_client.sent_messages) == sends_after_first
+    # 10. No additional draft, and nothing sent
+    assert len(drafted(test_env)) == drafts_after_first
+    assert wa_client.sent_messages == []
 
 
 def test_11_sender_conversations_remain_isolated(test_env):
@@ -406,74 +433,77 @@ def test_12_conversation_store_persists_state(test_env):
     assert len(state.history) == 4  # 2 user + 2 assistant messages
 
 
-def test_13_to_16_product_question_and_tool_flow(test_env):
-    """13-16. Product question:
-    13. uses product_lookup
-    14. product tool called with query
-    15. correct product result reaches model
-    16. grounded response accepted and sent.
+def test_13_to_16_price_question_and_tool_flow(test_env):
+    """13-16. Price question:
+    13. uses clinic_faq_lookup
+    14. tool called with the patient's (Hinglish) query
+    15. the real clinic price range reaches the model
+    16. grounded response accepted and queued for approval.
     """
     client = test_env["client"]
     llm = test_env["llm"]
     wa_client = test_env["wa_client"]
 
-    # Script round 1: model requests product_lookup tool call
-    # Script round 2: model provides grounded answer using real catalog SKU/price/tasting notes
     tc = ToolCall.from_raw_arguments(
         id="call_lookup_1",
-        name="product_lookup",
-        raw_arguments=json.dumps({"query": "ethiopia"}),
+        name="clinic_faq_lookup",
+        raw_arguments=json.dumps({"query": "RCT ka kitna lagega"}),
     )
     llm.responses = [
         LLMResponse(content=None, tool_calls=[tc], finish_reason="tool_calls"),
         LLMResponse(
-            content="Our Yirgacheffe Light (KB-SO-ETH-250) is ₹780 for 250g with jasmine, bergamot, and stone fruit notes.",
+            content="Root canal (RCT) ka kharcha ₹3,500–₹8,000 per tooth hota hai. Final cost dentist check-up ke baad batayenge.",
             finish_reason="stop",
         ),
     ]
 
-    payload = make_payload("Do you have Ethiopian coffee?", message_id="wamid.prod_013")
+    payload = make_payload("RCT ka kitna lagega?", message_id="wamid.prod_013")
     resp = client.post("/webhook/whatsapp", json=payload)
 
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    sent_text = wa_client.sent_messages[0]["body"]
-    assert "Yirgacheffe Light" in sent_text
-    assert "₹780" in sent_text
+    drafts = drafted(test_env)
+    assert len(drafts) == 1
+    assert "₹3,500–₹8,000" in drafts[0]
+    assert wa_client.sent_messages == []
 
-    # Verify tool results were passed to the second model call
     assert len(llm.agent_calls) == 2
     round2_messages = llm.agent_calls[1]["messages"]
     tool_msgs = [m for m in round2_messages if m.role == "tool"]
     assert len(tool_msgs) == 1
-    assert "KB-SO-ETH-250" in tool_msgs[0].content
+    assert "svc-root-canal" in tool_msgs[0].content
 
 
-def test_17_unsupported_product_claim_is_blocked(test_env):
-    """17. Unsupported product price is blocked by grounding validator."""
+def test_17_unsupported_price_claim_is_blocked(test_env):
+    """17. Unsupported service price is blocked by the grounding validator."""
     client = test_env["client"]
     llm = test_env["llm"]
-    wa_client = test_env["wa_client"]
 
-    # Model hallucinates an unsupported price for Yirgacheffe Light on both initial and corrective attempts
     llm.responses = [
-        LLMResponse(
-            content="Our Yirgacheffe Light is on sale for ₹100 today!",
-            finish_reason="stop",
-        ),
-        LLMResponse(
-            content="I still insist Yirgacheffe Light is only ₹100!",
-            finish_reason="stop",
-        ),
+        LLMResponse(content="Our root canal is on offer for just ₹999 today!", finish_reason="stop"),
+        LLMResponse(content="I still insist RCT is only ₹999!", finish_reason="stop"),
     ]
 
-    payload = make_payload("How much is Yirgacheffe?", message_id="wamid.halluc_017")
+    payload = make_payload("How much is a root canal?", message_id="wamid.halluc_017")
     resp = client.post("/webhook/whatsapp", json=payload)
 
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    # Rejected claim replaced with unverified recovery reply
-    assert wa_client.sent_messages[0]["body"] == UNVERIFIED_RECOVERY_REPLY
+    # Rejected claim replaced with the unverified recovery reply
+    assert drafted(test_env) == [UNVERIFIED_RECOVERY_REPLY]
+
+
+def test_17b_medical_advice_is_blocked(test_env):
+    """17b. A reply suggesting medicine never reaches the draft queue."""
+    client = test_env["client"]
+    llm = test_env["llm"]
+
+    llm.responses = [
+        LLMResponse(content="Take ibuprofen 400mg and you should be fine.", finish_reason="stop"),
+        LLMResponse(content="A painkiller like Combiflam will help.", finish_reason="stop"),
+    ]
+    resp = client.post("/webhook/whatsapp", json=make_payload("What should I take for sensitivity?"))
+
+    assert resp.status_code == 200
+    assert drafted(test_env) == [UNVERIFIED_RECOVERY_REPLY]
 
 
 def test_18_prompt_injection_gets_safe_refusal(test_env):
@@ -489,8 +519,8 @@ def test_18_prompt_injection_gets_safe_refusal(test_env):
     resp = client.post("/webhook/whatsapp", json=payload)
 
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    assert wa_client.sent_messages[0]["body"] == SAFE_REFUSAL_REPLY
+    assert drafted(test_env) == [SAFE_REFUSAL_REPLY]
+    assert resp.json()["is_urgent"] is False
     # No agent LLM call allowed for blocked turn
     assert len(llm.agent_calls) == 0
 
@@ -498,7 +528,7 @@ def test_18_prompt_injection_gets_safe_refusal(test_env):
 def test_19_to_20_human_request_creates_handoff_and_reply(test_env):
     """19-20. Human request:
     19. creates handoff in InMemoryHandoffSink
-    20. sends deterministic HUMAN_HANDOFF_REPLY.
+    20. queues deterministic HUMAN_HANDOFF_REPLY as an urgent draft.
     """
     client = test_env["client"]
     sink = test_env["sink"]
@@ -508,8 +538,10 @@ def test_19_to_20_human_request_creates_handoff_and_reply(test_env):
     resp = client.post("/webhook/whatsapp", json=payload)
 
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    assert wa_client.sent_messages[0]["body"] == HUMAN_HANDOFF_REPLY
+    assert drafted(test_env) == [HUMAN_HANDOFF_REPLY]
+    assert resp.json()["is_urgent"] is True
+    assert test_env["drafts"].list_pending()[0].is_urgent is True
+    assert wa_client.sent_messages == []
 
     # 19. Handoff created
     handoffs = sink.list()
@@ -523,19 +555,16 @@ def test_21_qualified_lead_creates_qualified_handoff(test_env):
     sink = test_env["sink"]
     llm = test_env["llm"]
 
-    # Provide extraction output qualifying consumer lead: contact_name, brew_method, taste_preference
-    extraction_json = json.dumps({
-        "track": "consumer",
-        "contact_name": "Ramesh",
-        "brew_method": "pourover",
-        "taste_preference": "fruity floral notes",
-        "intent_summary": "Looking for recommendations for pourover brewing",
+    # Name + concern + day/time; the WhatsApp number is the callback phone.
+    llm.extraction_response = json.dumps({
+        "patient_name": "Ramesh",
+        "concern": "teeth cleaning",
+        "preferred_day_time": "Saturday 11am",
     })
-    llm.extraction_response = extraction_json
-    llm.default_text = "Thank you Ramesh! I have noted your preferences for pourover brewing and our team will be in touch."
+    llm.default_text = "Thank you Ramesh! I've passed your cleaning request for Saturday 11am to our front desk."
 
     payload = make_payload(
-        "Hi, I am Ramesh. I brew pourover and love fruity floral notes.",
+        "Hi, I am Ramesh. I'd like a teeth cleaning on Saturday at 11am.",
         message_id="wamid.lead_021",
     )
     resp = client.post("/webhook/whatsapp", json=payload)
@@ -544,6 +573,10 @@ def test_21_qualified_lead_creates_qualified_handoff(test_env):
     handoffs = sink.list()
     assert len(handoffs) == 1
     assert handoffs[0].request.kind == HandoffKind.QUALIFIED_LEAD
+    assert handoffs[0].request.lead.preferred_day_time == "Saturday 11am"
+    # A complete booking request is not urgent: the model reply is queued normally.
+    assert resp.json()["is_urgent"] is False
+    assert drafted(test_env) == [llm.default_text]
 
 
 def test_22_handoff_deduplication(test_env):
@@ -571,20 +604,37 @@ def test_23_extraction_updates_lead_state(test_env):
     llm = test_env["llm"]
     sender = "919876543210"
 
-    llm.extraction_response = json.dumps({
-        "track": "consumer",
-        "contact_name": "Alice",
-        "city": "Mumbai",
-        "brew_method": "pourover",
-    })
+    llm.extraction_response = json.dumps({"patient_name": "Alice", "concern": "braces consultation"})
 
-    client.post("/webhook/whatsapp", json=make_payload("Hi, I am Alice in Mumbai, I brew pourover.", sender=sender))
+    client.post("/webhook/whatsapp", json=make_payload("Hi, I am Alice, I want to ask about braces.", sender=sender))
     state = store.get(sender)
 
     assert state is not None
-    assert state.lead.contact_name == "Alice"
-    assert state.lead.city == "Mumbai"
-    assert state.lead.brew_method.value == "pourover"
+    assert state.lead.patient_name == "Alice"
+    assert state.lead.concern == "braces consultation"
+    assert state.lead.callback_phone() == sender
+
+
+def test_23b_booking_details_are_asked_one_at_a_time(test_env):
+    """23b. Each turn authorizes exactly the next missing booking question."""
+    client = test_env["client"]
+    llm = test_env["llm"]
+    sender = "919876543210"
+
+    def system_prompt_of_last_agent_call() -> str:
+        return llm.agent_calls[-1]["messages"][0].content
+
+    llm.extraction_response = json.dumps({"concern": "cleaning"})
+    client.post("/webhook/whatsapp", json=make_payload("I want a cleaning", sender=sender, message_id="wamid.q1"))
+    assert "May I have the patient's name for the booking?" in system_prompt_of_last_agent_call()
+    assert "Which day and time" not in system_prompt_of_last_agent_call()
+
+    llm.extraction_response = json.dumps({"patient_name": "Asha"})
+    client.post("/webhook/whatsapp", json=make_payload("I'm Asha", sender=sender, message_id="wamid.q2"))
+    assert "Which day and time would suit you for the visit?" in system_prompt_of_last_agent_call()
+    assert "May I have the patient's name" not in system_prompt_of_last_agent_call()
+    # The WhatsApp number covers the phone, so it is never asked for.
+    assert "Which phone number" not in system_prompt_of_last_agent_call()
 
 
 def test_24_extraction_failure_does_not_crash_webhook(test_env):
@@ -596,9 +646,9 @@ def test_24_extraction_failure_does_not_crash_webhook(test_env):
     # Extraction returns invalid non-JSON output
     llm.extraction_response = "Malformed not-JSON output"
 
-    resp = client.post("/webhook/whatsapp", json=make_payload("Just asking about coffee."))
+    resp = client.post("/webhook/whatsapp", json=make_payload("Just asking about whitening."))
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
+    assert len(drafted(test_env)) == 1
 
 
 def test_25_llm_failure_returns_safe_behavior(test_env):
@@ -611,14 +661,13 @@ def test_25_llm_failure_returns_safe_behavior(test_env):
 
     resp = client.post("/webhook/whatsapp", json=make_payload("Hello?"))
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    assert wa_client.sent_messages[0]["body"] == SAFE_FALLBACK_REPLY
+    assert drafted(test_env) == [SAFE_FALLBACK_REPLY]
 
 
 def test_26_tool_failure_returns_safe_behavior(test_env):
     """26. Tool failure returns safe behavior."""
     from app.tools.registry import ToolSpec
-    from app.tools.schemas import ProductLookupInput
+    from app.tools.schemas import ClinicFaqLookupInput
 
     client = test_env["client"]
     llm = test_env["llm"]
@@ -627,12 +676,12 @@ def test_26_tool_failure_returns_safe_behavior(test_env):
     failing_tools = ToolRegistry()
     failing_tools.register(
         ToolSpec(
-            name="product_lookup",
-            description="Lookup products",
-            input_model=ProductLookupInput,
+            name="clinic_faq_lookup",
+            description="Lookup clinic facts",
+            input_model=ClinicFaqLookupInput,
             handler=lambda args: {
                 "status": "unavailable",
-                "error": {"code": "catalog_unavailable", "message": "Catalog offline", "fields": []},
+                "error": {"code": "clinic_info_unavailable", "message": "Clinic info offline", "fields": []},
             },
         )
     )
@@ -640,16 +689,16 @@ def test_26_tool_failure_returns_safe_behavior(test_env):
 
     tc = ToolCall.from_raw_arguments(
         id="call_fail",
-        name="product_lookup",
-        raw_arguments=json.dumps({"query": "espresso"}),
+        name="clinic_faq_lookup",
+        raw_arguments=json.dumps({"query": "whitening price"}),
     )
     llm.responses = [
         LLMResponse(content=None, tool_calls=[tc], finish_reason="tool_calls"),
-        LLMResponse(content="I could not check our live stock, but our core espresso is Bloom House.", finish_reason="stop"),
+        LLMResponse(content="I couldn't check that right now; the clinic team will confirm the whitening price.", finish_reason="stop"),
     ]
-    resp = client.post("/webhook/whatsapp", json=make_payload("Looking for espresso."))
+    resp = client.post("/webhook/whatsapp", json=make_payload("Whitening price?"))
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
+    assert len(drafted(test_env)) == 1
 
 
 def test_27_grounding_failure_fails_closed(test_env):
@@ -658,10 +707,9 @@ def test_27_grounding_failure_fails_closed(test_env):
     wa_client = test_env["wa_client"]
 
     with patch.object(GroundingValidator, "validate", side_effect=RuntimeError("Validator error")):
-        resp = client.post("/webhook/whatsapp", json=make_payload("Tell me about coffee."))
+        resp = client.post("/webhook/whatsapp", json=make_payload("Tell me about braces."))
         assert resp.status_code == 200
-        assert len(wa_client.sent_messages) == 1
-        assert wa_client.sent_messages[0]["body"] == UNVERIFIED_RECOVERY_REPLY
+        assert drafted(test_env) == [UNVERIFIED_RECOVERY_REPLY]
 
 
 def test_28_handoff_sink_failure_does_not_crash_webhook(test_env):
@@ -675,19 +723,25 @@ def test_28_handoff_sink_failure_does_not_crash_webhook(test_env):
 
     resp = client.post("/webhook/whatsapp", json=make_payload("Connect me to a person."))
     assert resp.status_code == 200
-    assert len(wa_client.sent_messages) == 1
-    assert wa_client.sent_messages[0]["body"] == HUMAN_HANDOFF_REPLY
+    assert drafted(test_env) == [HUMAN_HANDOFF_REPLY]
 
 
-def test_29_whatsapp_send_failure_returns_200(test_env):
-    """29. WhatsApp send failure returns safe 200 send_failed without crashing."""
+def test_29_whatsapp_send_failure_on_approval_keeps_draft_pending(test_env):
+    """29. A WhatsApp send failure when staff approve does not crash, and the
+    draft goes back to pending so it can be retried."""
     client = test_env["client"]
     wa_client = test_env["wa_client"]
     wa_client.raise_exc = WhatsAppClientError("Network timeout connecting to Meta")
 
     resp = client.post("/webhook/whatsapp", json=make_payload("Hello"))
     assert resp.status_code == 200
-    assert resp.json()["status"] == "send_failed"
+    assert resp.json()["status"] == "pending_approval"
+
+    draft_id = resp.json()["draft_id"]
+    approve = client.post(f"/staff/drafts/{draft_id}/approve", data={"text": "Hi!"}, follow_redirects=False)
+    assert approve.status_code == 303
+    assert "notice=send_failed" in approve.headers["location"]
+    assert [d.id for d in test_env["drafts"].list_pending()] == [draft_id]
 
 
 def test_30_provider_exception_text_not_logged_at_error(test_env, caplog):
@@ -723,15 +777,15 @@ def test_32_raw_tool_calls_not_logged(test_env, caplog):
     """32. Raw tool_calls are not logged in diagnostics or main INFO logs."""
     client = test_env["client"]
     llm = test_env["llm"]
-    raw_query = "special_secret_bean_xyz"
+    raw_query = "special_secret_query_xyz"
     tc = ToolCall.from_raw_arguments(
         id="call_99",
-        name="product_lookup",
+        name="clinic_faq_lookup",
         raw_arguments=json.dumps({"query": raw_query}),
     )
     llm.responses = [
         LLMResponse(content=None, tool_calls=[tc], finish_reason="tool_calls"),
-        LLMResponse(content="We have many beans.", finish_reason="stop"),
+        LLMResponse(content="We offer several treatments.", finish_reason="stop"),
     ]
 
     with caplog.at_level(logging.INFO):
@@ -791,7 +845,7 @@ def test_36_long_message_remains_bounded(test_env):
     client = test_env["client"]
     store = test_env["store"]
     sender = "919876543210"
-    long_text = "coffee " * 2000  # ~14,000 characters
+    long_text = "teeth " * 2000  # ~12,000 characters
 
     resp = client.post("/webhook/whatsapp", json=make_payload(long_text, sender=sender))
     assert resp.status_code == 200
@@ -869,7 +923,7 @@ def test_43_blank_text_message_ignored(test_env):
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
     assert resp.json()["reason"] == "empty_text"
-    assert len(wa_client.sent_messages) == 0
+    assert drafted(test_env) == []
 
 
 def test_44_orchestrator_unexpected_exception_returns_agent_error(test_env):
@@ -881,7 +935,7 @@ def test_44_orchestrator_unexpected_exception_returns_agent_error(test_env):
         resp = client.post("/webhook/whatsapp", json=make_payload("Hello", message_id="wamid.crash"))
         assert resp.status_code == 200
         assert resp.json()["status"] == "agent_error"
-        assert len(wa_client.sent_messages) == 0
+        assert drafted(test_env) == []
 
 
 def test_45_no_wamid_or_duplicate_logic_in_agent_package():
@@ -897,3 +951,35 @@ def test_45_no_wamid_or_duplicate_logic_in_agent_package():
             assert "mark_processed" not in content, f"WAMID logic found in {fname}"
             assert "app.memory" not in content, f"app.memory import found in {fname}"
             assert "app.whatsapp" not in content, f"app.whatsapp import found in {fname}"
+
+
+def test_46_emergency_is_urgent_draft_with_no_llm_call(test_env):
+    """46. A dental emergency skips the LLM and extraction, creates an urgent
+    handoff, and queues the language-matched callback reply as an urgent draft."""
+    client = test_env["client"]
+    llm = test_env["llm"]
+    sink = test_env["sink"]
+    wa_client = test_env["wa_client"]
+
+    resp = client.post("/webhook/whatsapp", json=make_payload("मेरे दाँत में बहुत दर्द हो रहा है", message_id="wamid.emg"))
+
+    assert resp.status_code == 200
+    assert resp.json()["is_urgent"] is True
+    assert llm.calls == []
+    [draft] = test_env["drafts"].list_pending()
+    assert draft.is_urgent is True
+    assert "क्लिनिक आपको जल्द ही कॉल करेगा" in draft.draft_text
+    assert sink.list()[0].request.priority.value == "urgent"
+    assert wa_client.sent_messages == []
+
+
+def test_47_urgent_drafts_listed_first_on_staff_page(test_env):
+    """47. /staff lists urgent drafts above older normal ones."""
+    client = test_env["client"]
+    test_env["llm"].default_text = "Cleaning is ₹800–₹1,500."
+    client.post("/webhook/whatsapp", json=make_payload("cleaning price?", sender="919800000001", message_id="wamid.n1"))
+    client.post("/webhook/whatsapp", json=make_payload("my tooth broke", sender="919800000002", message_id="wamid.u1"))
+
+    page = client.get("/staff").text
+    assert page.index("919800000002") < page.index("919800000001")
+    assert page.count("URGENT") == 1
